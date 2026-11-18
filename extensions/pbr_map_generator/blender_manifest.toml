@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "pbr_map_generator"
-version = "1.8.0"
+version = "1.9.0"
 name = "PBR Map Generator"
 tagline = "Make PBR maps from any image and generate procedural textures"
 maintainer = "Charlie Marshall"

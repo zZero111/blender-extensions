@@ -16,7 +16,7 @@ Find it in the 3D Viewport sidebar (N key) under the "PBR Maps" tab.
 bl_info = {
     "name": "PBR Map Generator",
     "author": "PBR Map Generator",
-    "version": (1, 8, 0),
+    "version": (1, 9, 0),
     "blender": (3, 6, 0),
     "location": "3D Viewport > Sidebar (N) > PBR Maps",
     "description": "Generate normal, bump, roughness and AO maps from images, plus procedural textures",
@@ -1403,6 +1403,8 @@ def _queue_preview(context, force=False):
     scene = context.scene if context else bpy.context.scene
     if not force and not scene.pbrgen.preview_live:
         return
+    if _preview_state.get("dragging"):
+        return  # the drag renders its own frames
     if bpy.app.timers.is_registered(_run_preview_timer):
         bpy.app.timers.unregister(_run_preview_timer)
     bpy.app.timers.register(_run_preview_timer, first_interval=0.4)
@@ -1468,7 +1470,8 @@ def _redraw_viewports(self=None, context=None):
 
 
 PREVIEW_IMAGE_NAME = ".PBRGen Preview"  # leading dot hides it from image lists
-_draw_state = {"handle": None, "visible": {}, "debug": {}}
+_draw_state = {"handle": None, "ui_handle": None, "visible": {}, "debug": {},
+               "sidebar_image": {}, "sidebar_drawing": {}}
 
 def sidebar_icon_scale(region_width, ui):
     """Icon scale that makes the sidebar preview fill the sidebar's width."""
@@ -1528,6 +1531,45 @@ def sync_viewport_overlay(context):
     bpy.app.timers.register(_tag, first_interval=0.0)
 
 
+def viewport_preview_rect(ctx, area, region):
+    """Where the viewport-corner preview is drawn, in region pixels: (x0, y0, x1, y1)."""
+    prefs = ctx.preferences.system
+    ui = prefs.ui_scale
+    size = ctx.scene.pbrgen.preview_viewport_size * ui
+    margin = 14 * ui
+    right = 0
+    if prefs.use_region_overlap and area.spaces.active.show_region_ui:
+        for r in area.regions:
+            if r.type == "UI" and r.width > 1:
+                right = r.width
+    x1 = region.width - right - margin
+    x0 = max(margin, x1 - size)
+    y0 = margin
+    return x0, y0, x1, y0 + (x1 - x0)
+
+
+def sidebar_preview_rect(region):
+    """Roughly where the Preview panel's image is in the sidebar, in region pixels:
+    (x0, y0, x1, y1), allowing for scrolling. The panel is the first one on the tab."""
+    ui = bpy.context.preferences.system.ui_scale
+    try:
+        scrolled = -region.view2d.region_to_view(0, region.height)[1]
+    except Exception:  # noqa: BLE001
+        scrolled = 0.0
+    top = region.height - 86 * ui + scrolled
+    size = region.width - 60 * ui
+    return 14 * ui, top - size, region.width - 26 * ui, top
+
+
+def _note_sidebar_drawn():
+    """Runs after each sidebar redraw: remembers whether the Preview panel's image
+    was drawn this time (it isn't when the panel is collapsed or another tab is open)."""
+    region = bpy.context.region
+    if region is not None:
+        key = region.as_pointer()
+        _draw_state["sidebar_image"][key] = _draw_state["sidebar_drawing"].pop(key, False)
+
+
 def _draw_viewport_preview():
     """Draws the latest preview in the bottom-right corner of every 3D viewport."""
     ctx = bpy.context
@@ -1547,19 +1589,8 @@ def _draw_viewport_preview():
     except Exception:  # noqa: BLE001 - e.g. temp file was cleaned up
         return
 
-    prefs = ctx.preferences.system
-    ui = prefs.ui_scale
-    size = scene.pbrgen.preview_viewport_size * ui
-    margin = 14 * ui
-    right = 0
-    if prefs.use_region_overlap and area.spaces.active.show_region_ui:
-        for r in area.regions:
-            if r.type == "UI" and r.width > 1:
-                right = r.width
-    x1 = region.width - right - margin
-    x0 = max(margin, x1 - size)
-    y0 = margin
-    y1 = y0 + (x1 - x0)
+    ui = ctx.preferences.system.ui_scale
+    x0, y0, x1, y1 = viewport_preview_rect(ctx, area, region)
 
     gpu.state.blend_set("ALPHA")
     frame = gpu.shader.from_builtin("UNIFORM_COLOR")
@@ -1638,13 +1669,15 @@ class PBRGEN_Props(bpy.types.PropertyGroup):
     preview_spin: FloatProperty(
         name="Spin", subtype="ANGLE", default=0.0, min=-math.pi, max=math.pi,
         step=500, precision=0, update=_on_shape_change,
-        description="Turn the preview shape around its vertical axis, to see its other sides. "
-                    "Only the preview turns: your scene is not changed")
+        description="How far the preview shape is turned around its vertical axis. "
+                    "Drag the preview image left or right to change it. Only the preview turns: "
+                    "your scene is not changed")
     preview_tilt: FloatProperty(
         name="Tilt", subtype="ANGLE", default=0.0, min=-math.pi / 2, max=math.pi / 2,
         step=500, precision=0, update=_on_shape_change,
-        description="Tip the preview shape towards you (positive) or away from you (negative), "
-                    "to see more of its top or bottom. Only the preview moves: your scene is not changed")
+        description="How far the preview shape is tipped towards you (positive) or away from you "
+                    "(negative). Drag the preview image up or down to change it. Only the preview "
+                    "moves: your scene is not changed")
     on_existing: EnumProperty(
         name="If It Already Exists",
         description="What to do when you generate a texture whose material already exists "
@@ -2111,22 +2144,35 @@ def preview_rotation(p, cam_loc):
     return Matrix.Rotation(p.preview_tilt, 4, side.normalized()) @ spin
 
 
-def render_preview(arrays, p, size=512):
-    """Render the maps on the chosen shape in a temporary scene; returns PNG path."""
-    if p.preview_view == "MAPS":
-        return maps_grid_png(arrays, size)
-    # Build the selected object's copy first, so a bad selection fails before any setup.
-    selected = selected_object_mesh() if p.preview_shape == "SELECTED" else None
-    made = {"images": [], "objects": [], "data": []}
-    maps = make_images("PBRGenPreview", arrays, keep=False)
-    made["images"] = list(maps.values())
-    mat = build_material("PBRGenPreview_Mat", maps, p)
-    scene = bpy.data.scenes.new("PBRGenPreview")
-    world = bpy.data.worlds.new("PBRGenPreview_World")
-    try:
+class PreviewRig:
+    """The temporary preview scene: shape, material, camera and lights.
+
+    Building it takes most of a preview's time, so while you drag to rotate the
+    preview it is built once and kept; each frame only turns the shape and
+    re-renders. Call free() when finished; nothing is left in your file."""
+
+    def __init__(self, arrays, p):
+        # Build the selected object's copy first, so a bad selection fails before any setup.
+        selected = selected_object_mesh() if p.preview_shape == "SELECTED" else None
+        self.made = {"images": [], "objects": [], "data": []}
+        self.scene = self.world = self.mat = None
+        try:
+            self._build(arrays, p, selected)
+        except Exception:
+            if selected is not None and selected[0] not in self.made["data"]:
+                bpy.data.meshes.remove(selected[0])
+            self.free()
+            raise
+
+    def _build(self, arrays, p, selected):
+        made = self.made
+        maps = make_images("PBRGenPreview", arrays, keep=False)
+        made["images"] = list(maps.values())
+        self.mat = build_material("PBRGenPreview_Mat", maps, p)
+        self.scene = scene = bpy.data.scenes.new("PBRGenPreview")
+        self.world = world = bpy.data.worlds.new("PBRGenPreview_World")
         _set_engine(scene)
         r = scene.render
-        r.resolution_x = r.resolution_y = size
         r.resolution_percentage = 100
         r.image_settings.file_format = "PNG"
         r.film_transparent = False
@@ -2159,51 +2205,47 @@ def render_preview(arrays, p, size=512):
             world.color = (0.18, 0.19, 0.21)
 
         def add(name, data, loc):
+            made["data"].append(data)
             obj = bpy.data.objects.new(name, data)
+            made["objects"].append(obj)
             obj.location = loc
             scene.collection.objects.link(obj)
-            made["objects"].append(obj)
-            made["data"].append(data)
             return obj
 
         if selected is not None:
-            mesh, obj_matrix, _name = selected
+            mesh, base, _name = selected
         else:
-            mesh, obj_matrix = make_shape_mesh(p.preview_shape), None
-        mesh.materials.append(mat)
-        shape_obj = add("PBRGenPreview_Obj", mesh, (0, 0, 0))
-        cam_loc = _preview_cam_loc(p.preview_shape)
-        # A selected object keeps its own rotation & scale from the scene; the
-        # user's Spin/Tilt then turns it (or the built-in shape) on top of that.
-        selected_matrix = obj_matrix
-        obj_matrix = preview_rotation(p, cam_loc) @ (
-            selected_matrix if selected_matrix is not None else Matrix.Identity(4))
-        shape_obj.matrix_basis = obj_matrix
+            mesh, base = make_shape_mesh(p.preview_shape), None
+        mesh.materials.append(self.mat)
+        self.mesh = mesh
+        self.shape_obj = add("PBRGenPreview_Obj", mesh, (0, 0, 0))
         if p.preview_shape == "MONKEY":
-            mod = shape_obj.modifiers.new("Subdivision", "SUBSURF")
+            mod = self.shape_obj.modifiers.new("Subdivision", "SUBSURF")
             mod.levels = mod.render_levels = 2
+        self.cam_loc = _preview_cam_loc(p.preview_shape)
+        self.fill = 1.9 if p.preview_view == "CLOSEUP" else 0.8
 
         # The built-in shapes are all about 3 m across, centred on the origin.
         # A selected object can be any size, anywhere, so scale the whole
         # camera + light rig around it (k = 1 for the built-in shapes).
+        # A selected object keeps its own rotation & scale from the scene; the
+        # user's drag-rotation then turns it around its centre on top of that.
         center, k = Vector((0.0, 0.0, 0.0)), 1.0
-        if selected_matrix is not None:
-            pts = _mesh_points(mesh, obj_matrix)
+        if base is not None:
+            pts = _mesh_points(mesh, base)
             lo, hi = pts.min(axis=0), pts.max(axis=0)
             center = Vector(((lo + hi) / 2).tolist())
             radius = float(np.linalg.norm(pts - np.array(center), axis=1).max())
             k = max(radius, 1e-4) / 1.6
+        self.base = base if base is not None else Matrix.Identity(4)
+        self.center = center
 
         cam_data = bpy.data.cameras.new("PBRGenPreview_Cam")
-        cam_data.lens = 50
         cam_data.clip_start = 0.01 * k
         cam_data.clip_end = 100.0 * k
-        cam = add("PBRGenPreview_Cam", cam_data, center + cam_loc * k)
-        _aim(cam, center)
-        scene.camera = cam
-        # Close-up zooms in until the surface fills the frame, so detail is easy to judge.
-        _frame_object(scene, cam, mesh, fill=1.9 if p.preview_view == "CLOSEUP" else 0.8,
-                      matrix=obj_matrix)
+        self.cam = add("PBRGenPreview_Cam", cam_data, center + self.cam_loc * k)
+        _aim(self.cam, center)
+        scene.camera = self.cam
 
         # Lighting chosen to make setting changes visible:
         #  - a small, low side light rakes across the surface so bumps cast shadows
@@ -2211,6 +2253,7 @@ def render_preview(arrays, p, size=512):
         #  - a weak fill keeps the shadow side readable
         #  - two low "reflection cards" sit where the camera sees their mirror image
         #    in the front and right faces: glossy = sharp bright sheen, rough = none
+        # The lights stay put while the shape turns, like a turntable in a studio.
         for name, energy, loc, sz in (("Key", 900, (-4.0, -2.5, 2.4), 0.8),
                                       ("Soft", 300, (2.0, -3.0, 5.5), 6.0),
                                       ("Fill", 60, (5.0, -1.0, 1.0), 4.0),
@@ -2222,6 +2265,23 @@ def render_preview(arrays, p, size=512):
             ld.size = sz * k
             _aim(add("PBRGenPreview_" + name, ld, center + Vector(loc) * k), center)
 
+    def render(self, p, size=512, samples=24):
+        """Turn the shape to the current rotation, re-frame and render; returns PNG path."""
+        scene = self.scene
+        c = Matrix.Translation(self.center)
+        matrix = c @ preview_rotation(p, self.cam_loc) @ c.inverted() @ self.base
+        self.shape_obj.matrix_basis = matrix
+        cam = self.cam
+        cam.data.lens = 50
+        cam.data.shift_x = cam.data.shift_y = 0.0
+        scene.render.resolution_x = scene.render.resolution_y = size
+        # Close-up zooms in until the surface fills the frame, so detail is easy to judge.
+        _frame_object(scene, cam, self.mesh, fill=self.fill, matrix=matrix)
+        if scene.render.engine == "CYCLES":
+            scene.cycles.samples = samples
+        elif hasattr(scene, "eevee"):
+            scene.eevee.taa_render_samples = samples
+
         bpy.ops.render.render(write_still=False, scene=scene.name)
         result = bpy.data.images.get("Render Result")
         if result is None:
@@ -2229,18 +2289,37 @@ def render_preview(arrays, p, size=512):
         path = _next_preview_path()
         result.save_render(path, scene=scene)
         return path
-    finally:
+
+    def free(self):
+        made = self.made
         for obj in made["objects"]:
             bpy.data.objects.remove(obj)
         for data in made["data"]:
             coll = {bpy.types.Mesh: bpy.data.meshes, bpy.types.Camera: bpy.data.cameras}.get(
                 type(data), bpy.data.lights)
             coll.remove(data)
-        bpy.data.scenes.remove(scene)
-        bpy.data.worlds.remove(world)
-        bpy.data.materials.remove(mat)
+        made["objects"], made["data"] = [], []
+        if self.scene is not None:
+            bpy.data.scenes.remove(self.scene)
+        if self.world is not None:
+            bpy.data.worlds.remove(self.world)
+        if self.mat is not None:
+            bpy.data.materials.remove(self.mat)
         for img in made["images"]:
             bpy.data.images.remove(img)
+        made["images"] = []
+        self.scene = self.world = self.mat = None
+
+
+def render_preview(arrays, p, size=512):
+    """Render the maps on the chosen shape in a temporary scene; returns PNG path."""
+    if p.preview_view == "MAPS":
+        return maps_grid_png(arrays, size)
+    rig = PreviewRig(arrays, p)
+    try:
+        return rig.render(p, size)
+    finally:
+        rig.free()
 
 
 def show_preview(path):
@@ -2495,13 +2574,9 @@ Nothing is added to your scene"""
     def execute(self, context):
         p = context.scene.pbrgen
         try:
-            if p.preview_source == "TEXTURE":
-                arrays = procedural_arrays(p, 512)
-            else:
-                src = get_source_image(self, p)
-                if src is None:
-                    return {"CANCELLED"}
-                arrays = image_arrays(read_rgb(src, min(p.max_size, 1024)), p)
+            arrays = preview_arrays(self, p)
+            if arrays is None:
+                return {"CANCELLED"}
             path = render_preview(arrays, p)
         except Exception as e:  # noqa: BLE001
             self.report({"ERROR"}, "Preview failed: %s" % e)
@@ -2510,24 +2585,110 @@ Nothing is added to your scene"""
         return {"FINISHED"}
 
 
-class PBRGEN_OT_rotate_preview(bpy.types.Operator):
-    """Turn the preview shape by 45 degrees"""
-    bl_idname = "pbrgen.rotate_preview"
-    bl_label = "Turn Preview"
+def preview_arrays(op, p):
+    """The maps the preview shows (512 px), or None if there's no source image."""
+    if p.preview_source == "TEXTURE":
+        return procedural_arrays(p, 512)
+    src = get_source_image(op, p)
+    if src is None:
+        return None
+    return image_arrays(read_rgb(src, min(p.max_size, 1024)), p)
+
+
+DRAG_QUALITY = (256, 4)  # size in pixels and render samples while dragging (smooth)
+DRAG_SPEED = 0.01        # radians turned per pixel of mouse movement
+
+
+class PBRGEN_OT_drag_preview(bpy.types.Operator):
+    """Click and drag the preview image to turn the shape and see it from any side"""
+    bl_idname = "pbrgen.drag_preview"
+    bl_label = "Rotate Preview"
     bl_options = {"INTERNAL"}
 
-    amount: FloatProperty(name="Amount", subtype="ANGLE", default=math.radians(45))
+    @staticmethod
+    def over_preview(context, event):
+        """True if the mouse is over a preview image (sidebar or viewport corner)."""
+        area, region = context.area, context.region
+        if area is None or region is None or area.type != "VIEW_3D":
+            return False
+        x, y = event.mouse_region_x, event.mouse_region_y
+        if region.type == "UI":
+            if not (_draw_state["sidebar_image"].get(region.as_pointer())
+                    and sidebar_preview_visible(area)):
+                return False
+            x0, y0, x1, y1 = sidebar_preview_rect(region)
+        elif region.type == "WINDOW":
+            if (not context.scene.pbrgen.preview_in_viewport
+                    or bpy.data.images.get(PREVIEW_IMAGE_NAME) is None
+                    or sidebar_preview_visible(area)):
+                return False
+            x0, y0, x1, y1 = viewport_preview_rect(context, area, region)
+        else:
+            return False
+        return x0 <= x <= x1 and y0 <= y <= y1
 
-    @classmethod
-    def description(cls, context, props):
-        side = "left" if props.amount < 0 else "right"
-        return "Turn the preview shape %d° to the %s, to see its other sides. " \
-               "Only the preview turns: your scene is not changed" % (round(math.degrees(abs(props.amount))), side)
-
-    def execute(self, context):
+    def invoke(self, context, event):
+        # This runs for every left click in the 3D view, so get out of the way quickly.
+        if context.scene is None or not hasattr(context.scene, "pbrgen"):
+            return {"PASS_THROUGH"}
         p = context.scene.pbrgen
-        # wrap around, so turning keeps going past 180°
-        p.preview_spin = (p.preview_spin + self.amount + math.pi) % (2 * math.pi) - math.pi
+        pcoll = preview_collections.get("main")
+        if (p.preview_view == "MAPS" or pcoll is None or "preview" not in pcoll
+                or _preview_state.get("dragging") or not self.over_preview(context, event)):
+            return {"PASS_THROUGH"}
+        try:
+            arrays = preview_arrays(self, p)
+            if arrays is None:
+                return {"CANCELLED"}
+            self.rig = PreviewRig(arrays, p)
+        except Exception as e:  # noqa: BLE001
+            self.report({"ERROR"}, "Preview failed: %s" % e)
+            return {"CANCELLED"}
+        self.start = (event.mouse_x, event.mouse_y, p.preview_spin, p.preview_tilt)
+        self.dirty = False
+        _preview_state["dragging"] = True
+        wm = context.window_manager
+        self.timer = wm.event_timer_add(1 / 60, window=context.window)
+        context.window.cursor_modal_set("HAND")
+        wm.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        p = context.scene.pbrgen
+        if event.type in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE"}:
+            x0, y0, spin0, tilt0 = self.start
+            ui = context.preferences.system.ui_scale
+            spin = spin0 + (event.mouse_x - x0) * DRAG_SPEED / ui
+            p.preview_spin = (spin + math.pi) % (2 * math.pi) - math.pi  # keep turning past 180°
+            p.preview_tilt = max(-math.pi / 2, min(math.pi / 2, tilt0 - (event.mouse_y - y0) * DRAG_SPEED / ui))
+            self.dirty = True
+        elif event.type == "TIMER":
+            # Mouse moves just record where the mouse is; rendering happens here, at
+            # most once per tick, so the preview never falls behind the mouse.
+            if self.dirty:
+                self.dirty = False
+                self.show(p, *DRAG_QUALITY)
+        elif event.type == "LEFTMOUSE" and event.value == "RELEASE":
+            return self.finish(context)
+        elif event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
+            p.preview_spin, p.preview_tilt = self.start[2], self.start[3]
+            return self.finish(context)
+        return {"RUNNING_MODAL"}
+
+    def show(self, p, size, samples):
+        try:
+            show_preview(self.rig.render(p, size, samples))
+        except Exception as e:  # noqa: BLE001
+            self.report({"ERROR"}, "Preview failed: %s" % e)
+
+    def finish(self, context):
+        try:
+            self.show(context.scene.pbrgen, 512, 24)  # full quality where you let go
+        finally:
+            self.rig.free()
+            context.window_manager.event_timer_remove(self.timer)
+            context.window.cursor_modal_restore()
+            _preview_state["dragging"] = False
         return {"FINISHED"}
 
 
@@ -2576,6 +2737,14 @@ class PBRGEN_PT_preview(PBRGEN_PT_base, bpy.types.Panel):
                 for text in ("Top left: Color", "Top right: Normal",
                              "Bottom left: Roughness", "Bottom right: Height"):
                     grid.label(text=text)
+            else:
+                # Lets a click on the image start a drag-to-rotate (see _note_sidebar_drawn)
+                _draw_state["sidebar_drawing"][context.region.as_pointer()] = True
+                row = layout.row(align=True)
+                row.label(text="Drag to rotate", icon="ORIENTATION_GIMBAL")
+                sub = row.row(align=True)
+                sub.enabled = abs(p.preview_spin) > 1e-6 or abs(p.preview_tilt) > 1e-6
+                sub.operator("pbrgen.reset_preview_rotation", text="Reset", icon="LOOP_BACK")
         else:
             box = layout.box()
             box.label(text="No preview yet", icon="INFO")
@@ -2597,17 +2766,6 @@ class PBRGEN_PT_preview(PBRGEN_PT_base, bpy.types.Panel):
                                  icon="INFO")
         else:
             layout.label(text="Shape: " + p.bl_rna.properties["preview_shape"].enum_items[p.preview_shape].name)
-        if p.preview_view != "MAPS":
-            col = layout.column(align=True)
-            row = col.row(align=True)
-            row.operator("pbrgen.rotate_preview", text="", icon="TRIA_LEFT").amount = -math.radians(45)
-            row.prop(p, "preview_spin")
-            row.operator("pbrgen.rotate_preview", text="", icon="TRIA_RIGHT").amount = math.radians(45)
-            row = col.row(align=True)
-            row.prop(p, "preview_tilt")
-            sub = row.row(align=True)
-            sub.enabled = abs(p.preview_spin) > 1e-6 or abs(p.preview_tilt) > 1e-6
-            sub.operator("pbrgen.reset_preview_rotation", text="Reset", icon="LOOP_BACK")
         layout.row().prop(p, "projection", expand=True)
         row = layout.row(align=True)
         row.operator("pbrgen.preview", icon="FILE_REFRESH")
@@ -2718,13 +2876,16 @@ classes = (
     PBRGEN_OT_from_image,
     PBRGEN_OT_procedural,
     PBRGEN_OT_preview,
-    PBRGEN_OT_rotate_preview,
+    PBRGEN_OT_drag_preview,
     PBRGEN_OT_reset_preview_rotation,
     PBRGEN_PT_preview,
     PBRGEN_PT_image,
     PBRGEN_PT_procedural,
     PBRGEN_PT_output,
 )
+
+
+addon_keymaps = []
 
 
 def register():
@@ -2736,6 +2897,14 @@ def register():
     if not bpy.app.background:
         _draw_state["handle"] = bpy.types.SpaceView3D.draw_handler_add(
             _draw_viewport_preview, (), "WINDOW", "POST_PIXEL")
+        _draw_state["ui_handle"] = bpy.types.SpaceView3D.draw_handler_add(
+            _note_sidebar_drawn, (), "UI", "POST_PIXEL")
+    # Left-click in the 3D view or its sidebar: starts a drag-to-rotate when the
+    # click is on a preview image, otherwise passes the click straight through.
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc is not None:
+        km = kc.keymaps.new(name="3D View Generic", space_type="VIEW_3D")
+        addon_keymaps.append((km, km.keymap_items.new("pbrgen.drag_preview", "LEFTMOUSE", "PRESS")))
     _subscribe_selection()
     bpy.app.handlers.load_post.append(_on_file_loaded)
     bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
@@ -2751,6 +2920,12 @@ def unregister():
     if _draw_state["handle"] is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_draw_state["handle"], "WINDOW")
         _draw_state["handle"] = None
+    if _draw_state["ui_handle"] is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_draw_state["ui_handle"], "UI")
+        _draw_state["ui_handle"] = None
+    for km, kmi in addon_keymaps:
+        km.keymap_items.remove(kmi)
+    addon_keymaps.clear()
     img = bpy.data.images.get(PREVIEW_IMAGE_NAME)
     if img is not None:
         bpy.data.images.remove(img)
