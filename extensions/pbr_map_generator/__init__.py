@@ -20,7 +20,7 @@ Find it in the 3D Viewport sidebar (N key) under the "PBR Maps" tab.
 bl_info = {  # only used by the old add-on system; blender_manifest.toml is what counts
     "name": "PBR Map Generator",
     "author": "PBR Map Generator",
-    "version": (1, 10, 1),
+    "version": (1, 11, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > PBR Maps",
     "description": "Generate normal, bump, roughness and AO maps from images, plus procedural textures",
@@ -1610,8 +1610,103 @@ def _socket(sockets, identifier, fallback_index):
     return sockets[fallback_index]
 
 
-def build_material(name, maps, props):
-    """maps: dict with keys albedo, height, normal, roughness, ao, [metallic] (Images)."""
+CURVATURE_ATTR = "pbr_curvature"
+
+
+def compute_curvature(mesh):
+    """Store how sharp/convex each vertex is (0 = flat or hollow, 1 = sharp outer
+    edge) as a mesh attribute, so the material can wear the model's real edges."""
+    n = len(mesh.vertices)
+    if n == 0 or len(mesh.edges) == 0:
+        return False
+    co = np.empty(n * 3, np.float32)
+    mesh.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3)
+    nor = np.empty(n * 3, np.float32)
+    try:
+        mesh.vertex_normals.foreach_get("vector", nor)
+    except AttributeError:
+        mesh.vertices.foreach_get("normal", nor)
+    nor = nor.reshape(-1, 3)
+    ev = np.empty(len(mesh.edges) * 2, np.int64)
+    mesh.edges.foreach_get("vertices", ev)
+    a, b = ev[0::2], ev[1::2]
+    d = co[b] - co[a]
+    d /= np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-9)
+    # A neighbour that sits "below" a vertex's normal means the surface bends away: convex.
+    conv = np.zeros(n, np.float64)
+    deg = np.zeros(n, np.float64)
+    np.add.at(conv, a, -(nor[a] * d).sum(1))
+    np.add.at(conv, b, (nor[b] * d).sum(1))
+    np.add.at(deg, a, 1)
+    np.add.at(deg, b, 1)
+    conv /= np.maximum(deg, 1)
+    for _ in range(2):  # smooth a little so the wear isn't speckled
+        s = np.zeros(n)
+        np.add.at(s, a, conv[b])
+        np.add.at(s, b, conv[a])
+        conv = conv * 0.5 + s / np.maximum(deg, 1) * 0.5
+    value = np.clip(conv * 3.0, 0, 1).astype(np.float32)
+    attr = mesh.attributes.get(CURVATURE_ATTR)
+    if attr is None or attr.domain != "POINT" or attr.data_type != "FLOAT":
+        if attr is not None:
+            mesh.attributes.remove(attr)
+        attr = mesh.attributes.new(CURVATURE_ATTR, "FLOAT", "POINT")
+    attr.data.foreach_set("value", value)
+    mesh.update()
+    return True
+
+
+def uv_metres_per_unit(mesh, matrix):
+    """How many metres one UV unit covers on this mesh (from its area), or None."""
+    uv = mesh.uv_layers.active
+    if uv is None or not mesh.polygons:
+        return None
+    mesh.calc_loop_triangles()
+    nt = len(mesh.loop_triangles)
+    if nt == 0:
+        return None
+    tri_loops = np.empty(nt * 3, np.int64)
+    mesh.loop_triangles.foreach_get("loops", tri_loops)
+    tri_verts = np.empty(nt * 3, np.int64)
+    mesh.loop_triangles.foreach_get("vertices", tri_verts)
+    uvs = np.empty(len(mesh.loops) * 2, np.float32)
+    uv.data.foreach_get("uv", uvs)
+    uvs = uvs.reshape(-1, 2)[tri_loops].reshape(-1, 3, 2)
+    co = np.empty(len(mesh.vertices) * 3, np.float32)
+    mesh.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3)
+    if matrix is not None:
+        m = np.array(matrix, np.float64)
+        co = co @ m[:3, :3].T
+    p = co[tri_verts].reshape(-1, 3, 3)
+    area3 = 0.5 * np.linalg.norm(np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), axis=1).sum()
+    e1, e2 = uvs[:, 1] - uvs[:, 0], uvs[:, 2] - uvs[:, 0]
+    area_uv = 0.5 * np.abs(e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]).sum()
+    if area_uv < 1e-12 or area3 < 1e-12:
+        return None
+    return float(np.sqrt(area3 / area_uv))
+
+
+def material_tiling(props, mesh=None, matrix=None, real_size=None):
+    """(repeats per unit, per-axis scale) for the material's Mapping node.
+    In Real-World Size mode the texture covers `real_size` metres per repeat on
+    this object, allowing for its scale (Box) or its UV layout (UV)."""
+    if getattr(props, "size_mode", "TILING") != "REAL":
+        return props.tiling, (1.0, 1.0, 1.0)
+    size = max(1e-4, real_size or props.real_size)
+    if props.projection == "BOX":
+        sc = tuple(matrix.to_scale()) if matrix is not None else (1.0, 1.0, 1.0)
+        return 2.0 / size, sc
+    per_unit = uv_metres_per_unit(mesh, matrix) if mesh is not None else None
+    if per_unit is None:
+        return props.tiling, (1.0, 1.0, 1.0)
+    return per_unit / size, (1.0, 1.0, 1.0)
+
+
+def build_material(name, maps, props, tiling=None, axis_scale=(1.0, 1.0, 1.0), projection=None):
+    """maps: dict with keys albedo, height, normal, roughness, ao, [metallic] (Images).
+    tiling / axis_scale: from material_tiling(); projection overrides props.projection."""
     mat = bpy.data.materials.new(name)
     if mat.node_tree is None or not getattr(mat, "use_nodes", True):
         try:
@@ -1621,85 +1716,219 @@ def build_material(name, maps, props):
     nt = mat.node_tree
     nodes, links = nt.nodes, nt.links
     nodes.clear()
+    tiling = props.tiling if tiling is None else tiling
+    projection = projection or getattr(props, "projection", "UV")
 
     out = nodes.new("ShaderNodeOutputMaterial")
-    out.location = (900, 0)
+    out.location = (1300, 0)
     bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-    bsdf.location = (550, 0)
+    bsdf.location = (950, 0)
     links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
 
-    use_box = getattr(props, "projection", "UV") == "BOX"
+    use_box = projection == "BOX"
     coord = nodes.new("ShaderNodeTexCoord")
-    coord.location = (-1100, 0)
+    coord.location = (-1500, 0)
     mapping = nodes.new("ShaderNodeMapping")
-    mapping.location = (-900, 0)
+    mapping.location = (-1300, 0)
     if use_box:
         # Object coordinates: at Tiling 1 the texture repeats once every 2 m
         # (exactly once per face of the default cube).
-        s = props.tiling / 2.0
-        mapping.inputs["Scale"].default_value = (s, s, s)
+        s = tiling / 2.0
+        mapping.inputs["Scale"].default_value = tuple(s * k for k in axis_scale)
         mapping.inputs["Location"].default_value = (0.5, 0.5, 0.5)
         links.new(coord.outputs["Object"], mapping.inputs["Vector"])
     else:
-        mapping.inputs["Scale"].default_value = (props.tiling, props.tiling, 1.0)
+        mapping.inputs["Scale"].default_value = (tiling, tiling, 1.0)
         links.new(coord.outputs["UV"], mapping.inputs["Vector"])
 
-    def tex(img, label, y):
-        n = nodes.new("ShaderNodeTexImage")
-        n.image = img
-        n.label = label
-        n.location = (-600, y)
+    # Anti-tiling: read every map a second time, shifted (and turned, with UVs),
+    # and blend the two with a big soft noise, so large surfaces don't show the
+    # same texture repeating in a grid.
+    anti = getattr(props, "anti_tiling", False) and props.anti_tiling_amount > 0
+    fac = None
+    if anti:
+        mapping2 = nodes.new("ShaderNodeMapping")
+        mapping2.label = "Anti-Tiling Offset"
+        mapping2.location = (-1300, -420)
+        mapping2.inputs["Scale"].default_value = mapping.inputs["Scale"].default_value
         if use_box:
-            n.projection = "BOX"
-            n.projection_blend = props.box_blend
-        links.new(mapping.outputs["Vector"], n.inputs["Vector"])
-        return n
+            mapping2.inputs["Location"].default_value = (0.87, 1.11, 0.73)
+            links.new(coord.outputs["Object"], mapping2.inputs["Vector"])
+        else:
+            mapping2.inputs["Location"].default_value = (0.37, 0.61, 0.0)
+            mapping2.inputs["Rotation"].default_value = (0.0, 0.0, 1.1)
+            links.new(coord.outputs["UV"], mapping2.inputs["Vector"])
+        noise = nodes.new("ShaderNodeTexNoise")
+        noise.label = "Anti-Tiling Mask"
+        noise.location = (-1100, 700)
+        noise.inputs["Scale"].default_value = 0.45
+        noise.inputs["Detail"].default_value = 2.0
+        links.new(mapping.outputs["Vector"], noise.inputs["Vector"])
+        ramp = nodes.new("ShaderNodeMapRange")
+        ramp.location = (-900, 700)
+        ramp.inputs["From Min"].default_value = 0.42
+        ramp.inputs["From Max"].default_value = 0.58
+        ramp.inputs["To Max"].default_value = props.anti_tiling_amount
+        links.new(noise.outputs["Fac"], ramp.inputs["Value"])
+        fac = ramp.outputs["Result"]
 
-    albedo = tex(maps["albedo"], "Base Color", 400)
-    ao = tex(maps["ao"], "Ambient Occlusion", 120)
-    rough = tex(maps["roughness"], "Roughness", -160)
-    normal = tex(maps["normal"], "Normal", -440)
-    height = tex(maps["height"], "Height / Bump", -720)
+    def tex(img, label, y):
+        """Image texture node(s); returns the colour output (blended if anti-tiling)."""
+        def one(vec, yy, lab):
+            n = nodes.new("ShaderNodeTexImage")
+            n.image = img
+            n.label = lab
+            n.location = (-800, yy)
+            if use_box:
+                n.projection = "BOX"
+                n.projection_blend = props.box_blend
+            links.new(vec, n.inputs["Vector"])
+            return n
+        a = one(mapping.outputs["Vector"], y, label)
+        if not anti:
+            return a.outputs["Color"]
+        b = one(mapping2.outputs["Vector"], y - 140, label + " (offset)")
+        b.hide = True
+        m = nodes.new("ShaderNodeMix")
+        m.data_type = "RGBA"
+        m.label = label + " Blend"
+        m.location = (-500, y)
+        m.hide = True
+        links.new(fac, m.inputs[0])
+        links.new(a.outputs["Color"], _socket(m.inputs, "A_Color", 6))
+        links.new(b.outputs["Color"], _socket(m.inputs, "B_Color", 7))
+        return _socket(m.outputs, "Result_Color", 2)
+
+    albedo = tex(maps["albedo"], "Base Color", 500)
+    ao = tex(maps["ao"], "Ambient Occlusion", 200)
+    rough = tex(maps["roughness"], "Roughness", -100)
+    normal = tex(maps["normal"], "Normal", -400)
+    height = tex(maps["height"], "Height / Bump", -700)
 
     # Base color multiplied by AO
     mix = nodes.new("ShaderNodeMix")
     mix.data_type = "RGBA"
     mix.blend_type = "MULTIPLY"
     mix.label = "AO Multiply"
-    mix.location = (-50, 300)
+    mix.location = (-250, 400)
     mix.inputs[0].default_value = props.ao_mix
-    links.new(albedo.outputs["Color"], _socket(mix.inputs, "A_Color", 6))
-    links.new(ao.outputs["Color"], _socket(mix.inputs, "B_Color", 7))
-    links.new(_socket(mix.outputs, "Result_Color", 2), bsdf.inputs["Base Color"])
+    links.new(albedo, _socket(mix.inputs, "A_Color", 6))
+    links.new(ao, _socket(mix.inputs, "B_Color", 7))
+    color = _socket(mix.outputs, "Result_Color", 2)
+    rough_out = rough
 
-    links.new(rough.outputs["Color"], bsdf.inputs["Roughness"])
+    # Wear and dirt that follow the real model: worn on its sharp outer edges
+    # (from the curvature attribute), dirty in its corners and creases (AO).
+    edge_amt = getattr(props, "object_edge_wear", 0.0)
+    dirt_amt = getattr(props, "object_dirt", 0.0)
+    if edge_amt > 0 or dirt_amt > 0:
+        def mixer(kind, a, b, f, label, loc):
+            m = nodes.new("ShaderNodeMix")
+            m.data_type = kind
+            m.label = label
+            m.location = loc
+            links.new(f, m.inputs[0])
+            ia, ib, io = (("A_Color", 6), ("B_Color", 7), ("Result_Color", 2)) if kind == "RGBA" else \
+                         (("A_Float", 2), ("B_Float", 3), ("Result_Float", 0))
+            for ident, idx, val in ((ia[0], ia[1], a), (ib[0], ib[1], b)):
+                sock = _socket(m.inputs, ident, idx)
+                if isinstance(val, bpy.types.NodeSocket):
+                    links.new(val, sock)
+                else:
+                    sock.default_value = val
+            return _socket(m.outputs, io[0], io[1])
+
+        def breakup(scale, lo, hi, loc):
+            n = nodes.new("ShaderNodeTexNoise")
+            n.location = loc
+            n.inputs["Scale"].default_value = scale
+            n.inputs["Detail"].default_value = 6.0
+            links.new(coord.outputs["Object"], n.inputs["Vector"])
+            r = nodes.new("ShaderNodeMapRange")
+            r.location = (loc[0] + 200, loc[1])
+            r.inputs["From Min"].default_value = lo
+            r.inputs["From Max"].default_value = hi
+            links.new(n.outputs["Fac"], r.inputs["Value"])
+            return r.outputs["Result"]
+
+        def times(x, y, amount, label, loc):
+            m = nodes.new("ShaderNodeMath")
+            m.operation = "MULTIPLY"
+            m.location = loc
+            links.new(x, m.inputs[0])
+            links.new(y, m.inputs[1])
+            m2 = nodes.new("ShaderNodeMath")
+            m2.operation = "MULTIPLY"
+            m2.label = label
+            m2.use_clamp = True
+            m2.location = (loc[0] + 180, loc[1])
+            links.new(m.outputs[0], m2.inputs[0])
+            m2.inputs[1].default_value = amount * 1.6
+            return m2.outputs[0]
+
+        if edge_amt > 0:
+            attr = nodes.new("ShaderNodeAttribute")
+            attr.attribute_name = CURVATURE_ATTR
+            attr.label = "Model Edges (curvature)"
+            attr.location = (-500, 1100)
+            r = nodes.new("ShaderNodeMapRange")
+            r.location = (-300, 1100)
+            r.inputs["From Min"].default_value = 0.08
+            r.inputs["From Max"].default_value = 0.45
+            links.new(attr.outputs["Fac"], r.inputs["Value"])
+            f = times(r.outputs["Result"], breakup(18.0, 0.35, 0.65, (-700, 900)), edge_amt, "Edge Wear Mask", (-100, 1100))
+            scr =nodes.new("ShaderNodeMix")
+            scr.data_type = "RGBA"
+            scr.blend_type = "SCREEN"
+            scr.location = (300, 1000)
+            scr.inputs[0].default_value = 1.0
+            links.new(color, _socket(scr.inputs, "A_Color", 6))
+            _socket(scr.inputs, "B_Color", 7).default_value = (0.28, 0.28, 0.28, 1.0)
+            color = mixer("RGBA", color, _socket(scr.outputs, "Result_Color", 2), f, "Worn Edges", (500, 800))
+            rough_out = mixer("FLOAT", rough_out, 0.35, f, "Worn Edges Roughness", (500, 600))
+        if dirt_amt > 0:
+            aon = nodes.new("ShaderNodeAmbientOcclusion")
+            aon.location = (-500, 1400)
+            aon.samples = 16
+            aon.only_local = True
+            aon.inputs["Distance"].default_value = 0.25
+            inv = nodes.new("ShaderNodeMapRange")
+            inv.location = (-300, 1400)
+            inv.inputs["From Min"].default_value = 0.95
+            inv.inputs["From Max"].default_value = 0.45
+            links.new(aon.outputs["AO"], inv.inputs["Value"])
+            f = times(inv.outputs["Result"], breakup(3.0, 0.3, 0.7, (-700, 1250)), dirt_amt, "Dirt Mask", (-100, 1400))
+            color = mixer("RGBA", color, (0.10, 0.075, 0.05, 1.0), f, "Dirt in Corners", (700, 900))
+            rough_out = mixer("FLOAT", rough_out, 0.95, f, "Dirt Roughness", (700, 650))
+
+    links.new(color, bsdf.inputs["Base Color"])
+    links.new(rough_out, bsdf.inputs["Roughness"])
 
     if maps.get("metallic") is not None:
-        metal = tex(maps["metallic"], "Metallic", 680)
-        links.new(metal.outputs["Color"], bsdf.inputs["Metallic"])
+        metal = tex(maps["metallic"], "Metallic", 800)
+        links.new(metal, bsdf.inputs["Metallic"])
 
-    if use_box:
-        # Normal maps rely on UV directions, so box mode builds the bumps from
-        # the height map instead (works with any projection).
-        normal.label = "Normal (used in UV mode)"
+    if use_box or anti:
+        # Normal maps rely on UV directions (and anti-tiling turns the second copy),
+        # so these build the bumps from the height map instead (works any way round).
         bump = nodes.new("ShaderNodeBump")
-        bump.location = (-50, -600)
+        bump.location = (500, -600)
         bump.inputs["Strength"].default_value = 1.0
         bump.inputs["Distance"].default_value = 0.008 * props.normal_strength
-        links.new(height.outputs["Color"], bump.inputs["Height"])
+        links.new(height, bump.inputs["Height"])
         links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
     else:
         nmap = nodes.new("ShaderNodeNormalMap")
-        nmap.location = (-50, -440)
+        nmap.location = (500, -400)
         nmap.inputs["Strength"].default_value = 1.0
-        links.new(normal.outputs["Color"], nmap.inputs["Color"])
+        links.new(normal, nmap.inputs["Color"])
         links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
 
     disp = nodes.new("ShaderNodeDisplacement")
-    disp.location = (550, -600)
+    disp.location = (950, -600)
     disp.inputs["Midlevel"].default_value = 0.5
     disp.inputs["Scale"].default_value = props.displacement_scale
-    links.new(height.outputs["Color"], disp.inputs["Height"])
+    links.new(height, disp.inputs["Height"])
     if props.use_displacement:
         links.new(disp.outputs["Displacement"], out.inputs["Displacement"])
         if hasattr(mat, "displacement_method"):
@@ -1744,9 +1973,15 @@ def add_displacement_subdivision(obj, levels):
     return True
 
 
-def finish(op, context, base, maps, props, replace=False, assign=True, quiet=False):
+def finish(op, context, base, maps, props, replace=False, assign=True, quiet=False,
+           real_size=None, projection=None):
     old = bpy.data.materials.get(base) if replace else None
-    mat = build_material(base, maps, props)
+    target = context.active_object if (props.assign_to_active and assign) else None
+    if target is not None and target.type != "MESH":
+        target = None
+    tiling, axis = material_tiling(props, target.data if target else None,
+                                   target.matrix_world if target else None, real_size)
+    mat = build_material(base, maps, props, tiling, axis, projection)
     if replace:
         replace_datablock(old, mat, base)
     msg = ("Replaced material '%s'" if old is not None else "Created material '%s'") % mat.name
@@ -1759,6 +1994,8 @@ def finish(op, context, base, maps, props, replace=False, assign=True, quiet=Fal
             msg += " on '%s'" % obj.name
             if props.use_displacement and props.displacement_subdivide:
                 add_displacement_subdivision(obj, props.displacement_levels)
+            if props.object_edge_wear > 0 and obj.type == "MESH":
+                compute_curvature(obj.data)
             if props.projection == "UV" and obj.type == "MESH" and not obj.data.uv_layers:
                 op.report({"WARNING"}, "Object has no UV map; unwrap it (U) to see the texture")
         else:
@@ -2191,6 +2428,31 @@ def _on_pattern_change(self, context):
 # Properties (every description below is the hover tooltip in Blender)
 # ---------------------------------------------------------------------------
 
+def _trim_static_items():
+    items = [("NONE", "(empty)", "Leave this strip out", 99)]
+    for heading, keys in PATTERN_GROUPS:
+        items.append(("", heading, ""))
+        for k in keys:
+            items.append((k, PATTERNS[k][0], PATTERN_TIPS[k], PATTERN_IDS[k]))
+    return items
+
+
+TRIM_ITEMS = _trim_static_items()
+
+
+def _dyn_items(name):
+    """Items for enums whose choices are made at run time (thumbnails)."""
+    def items(self, context):
+        return globals()[name](self, context)
+    return items
+
+
+def _dyn_update(name):
+    def update(self, context):
+        return globals()[name](self, context)
+    return update
+
+
 def _col(name, default, desc):
     return FloatVectorProperty(name=name, subtype="COLOR_GAMMA", size=3, default=default,
                                min=0.0, max=1.0, description=desc, update=schedule_preview)
@@ -2517,6 +2779,103 @@ class PBRGEN_Props(bpy.types.PropertyGroup):
         name="Worn Edges", default=0.0, min=0.0, max=1.0, subtype="FACTOR", update=schedule_preview,
         description="Raised edges rubbed lighter and smoother, as if worn by years of use. "
                     "On metal patterns the bare metal shows through")
+
+    # --- material extras
+    size_mode: EnumProperty(
+        name="Texture Size",
+        description="How big the texture is on the object",
+        items=[("TILING", "Tiling", "Set how many times the texture repeats (Tiling)"),
+               ("REAL", "Real-World Size", "Set how many meters one repeat of the texture covers, so bricks, "
+                                           "planks and tiles come out life-size on any object")],
+        default="TILING", update=schedule_preview)
+    real_size: FloatProperty(
+        name="One Repeat", default=2.0, min=0.01, soft_max=20.0, unit="LENGTH", update=schedule_preview,
+        description="How much of the object one repeat of the texture covers, in meters. "
+                    "Poly Haven textures use their own real size automatically")
+    anti_tiling: BoolProperty(
+        name="Hide Repeats", default=False, update=schedule_preview,
+        description="Stop large surfaces showing the same texture repeating in a grid: the material "
+                    "blends in a shifted (and, with UVs, turned) copy using a big soft noise")
+    anti_tiling_amount: FloatProperty(
+        name="Amount", default=1.0, min=0.0, max=1.0, subtype="FACTOR", update=schedule_preview,
+        description="How much of the shifted copy is blended in")
+    object_edge_wear: FloatProperty(
+        name="Model Edge Wear", default=0.0, min=0.0, max=1.0, subtype="FACTOR", update=schedule_preview,
+        description="Wear on the sharp outer edges of the actual model (not just the texture's bumps): "
+                    "paler and smoother where corners would get knocked. Works best on models with "
+                    "bevels or enough faces. Use Update Edge Map after changing the model's shape")
+    object_dirt: FloatProperty(
+        name="Model Dirt", default=0.0, min=0.0, max=1.0, subtype="FACTOR", update=schedule_preview,
+        description="Dirt collecting in the inside corners and creases of the actual model "
+                    "(uses ambient occlusion, so it follows the shape live)")
+    export_sizes: EnumProperty(
+        name="Also Save",
+        description="Also save smaller copies of every map into subfolders of the Save Folder "
+                    "(for game levels of detail or sharing). Needs a Save Folder",
+        items=[("2048", "2K", "Also save 2048 px copies"),
+               ("1024", "1K", "Also save 1024 px copies"),
+               ("512", "512", "Also save 512 px copies"),
+               ("256", "256", "Also save 256 px copies")],
+        options={"ENUM_FLAG"}, default=set())
+
+    # --- variations and colors from a photo
+    variation_pick: EnumProperty(
+        name="Variations", items=_dyn_items("_variation_items"), update=_dyn_update("_apply_variation"),
+        description="Pick a variation to use its seed and colors")
+    color_ref_image: PointerProperty(
+        name="Reference Photo", type=bpy.types.Image,
+        description="A photo to take the pattern's colors from (for example a real brick wall)")
+
+    # --- blending two materials
+    blend_a: PointerProperty(name="Material A", type=bpy.types.Material,
+                             description="The base material")
+    blend_b: PointerProperty(name="Material B", type=bpy.types.Material,
+                             description="The material blended on top")
+    blend_mask: EnumProperty(
+        name="Mask", description="What decides where each material shows",
+        items=[("NOISE", "Noise", "Natural patches made by a noise pattern"),
+               ("PAINT", "Paint", "Paint where Material B goes in Vertex Paint mode (white = B)")],
+        default="NOISE")
+    blend_amount: FloatProperty(name="Amount of B", default=0.5, min=0.0, max=1.0, subtype="FACTOR",
+                                description="How much of the surface Material B covers (Noise mask)")
+    blend_scale: FloatProperty(name="Patch Size", default=2.0, min=0.05, soft_max=20.0,
+                               description="Noise mask: smaller = bigger patches")
+    blend_sharpness: FloatProperty(name="Sharpness", default=4.0, min=1.0, soft_max=20.0,
+                                   description="How hard the edge between the two materials is")
+    blend_use_height: BoolProperty(name="Fill Low Areas First", default=True,
+                                   description="Material B settles into the gaps and low parts of Material A first, "
+                                               "like mud in cracks or moss between stones")
+
+    # --- trim sheet
+    trim_pattern_1: EnumProperty(name="Strip 1", items=TRIM_ITEMS, default="METAL",
+                                 description="Pattern for this strip (bottom strip first)")
+    trim_pattern_2: EnumProperty(name="Strip 2", items=TRIM_ITEMS, default="BRICKS",
+                                 description="Pattern for this strip")
+    trim_pattern_3: EnumProperty(name="Strip 3", items=TRIM_ITEMS, default="PLANKS",
+                                 description="Pattern for this strip")
+    trim_pattern_4: EnumProperty(name="Strip 4", items=TRIM_ITEMS, default="CONCRETE",
+                                 description="Pattern for this strip")
+    trim_size_1: IntProperty(name="Height", default=1, min=1, max=8, description="How tall this strip is, compared with the others")
+    trim_size_2: IntProperty(name="Height", default=2, min=1, max=8, description="How tall this strip is, compared with the others")
+    trim_size_3: IntProperty(name="Height", default=2, min=1, max=8, description="How tall this strip is, compared with the others")
+    trim_size_4: IntProperty(name="Height", default=3, min=1, max=8, description="How tall this strip is, compared with the others")
+
+    # --- Poly Haven
+    ph_search: StringProperty(name="Search", default="",
+                              description="Words to search for, like 'red brick' or 'oak floor'. Leave empty to see the most popular")
+    ph_category: EnumProperty(
+        name="Category", description="Only show this kind of texture",
+        items=[("ALL", "All", "")] + [(c.upper(), c.title(), "") for c in
+               ("brick", "wood", "rock", "floor", "wall", "ground", "metal", "fabric", "plaster",
+                "concrete", "roofing", "terrain", "road", "sand", "snow", "tiles")],
+        default="ALL")
+    ph_resolution: EnumProperty(
+        name="Resolution", description="Size of the maps to download",
+        items=[("1k", "1K", "1024 px: quick to download"), ("2k", "2K", "2048 px: good default"),
+               ("4k", "4K", "4096 px: very detailed, large download")],
+        default="2k")
+    ph_pick: EnumProperty(name="Texture", items=_dyn_items("_ph_items"),
+                          description="The Poly Haven texture to download")
 
 
 # ---------------------------------------------------------------------------
@@ -2874,7 +3233,6 @@ class PreviewRig:
         made = self.made
         maps = make_images("PBRGenPreview", arrays, keep=False)
         made["images"] = list(maps.values())
-        self.mat = build_material("PBRGenPreview_Mat", maps, p)
         self.scene = scene = bpy.data.scenes.new("PBRGenPreview")
         self.world = world = bpy.data.worlds.new("PBRGenPreview_World")
         _set_engine(scene)
@@ -2948,6 +3306,10 @@ class PreviewRig:
             mesh, base, _name = selected
         else:
             mesh, base = make_shape_mesh(p.preview_shape), None
+        tiling, axis = material_tiling(p, mesh, base)
+        self.mat = build_material("PBRGenPreview_Mat", maps, p, tiling, axis)
+        if p.object_edge_wear > 0:
+            compute_curvature(mesh)
         mesh.materials.append(self.mat)
         self.mesh = mesh
         self.shape_obj = add("PBRGenPreview_Obj", mesh, (0, 0, 0))
@@ -3147,6 +3509,7 @@ def snapshot_settings(p):
         if prop.type in ("FLOAT", "INT", "BOOLEAN") and getattr(prop, "is_array", False):
             value = tuple(value)
         setattr(snap, ident, value)
+    snap._out_dir_abs = bpy.path.abspath(p.out_dir) if p.out_dir else ""
     return snap
 
 
@@ -3295,6 +3658,7 @@ build a material from them and put it on the selected object"""
         def work(stage):
             stage("making maps")
             arrays = add_engine_maps(image_arrays(rgb, settings), settings.pack_maps)
+            write_extra_sizes(base, arrays, settings)
             stage("encoding images")
             return encode_maps(arrays)
 
@@ -3329,6 +3693,7 @@ build a material and put it on the selected object"""
         def work(stage):
             stage("making %dpx maps" % size)
             arrays = add_engine_maps(procedural_arrays(settings, size), settings.pack_maps)
+            write_extra_sizes(base, arrays, settings)
             stage("encoding images")
             return encode_maps(arrays)
 
@@ -3413,7 +3778,9 @@ Runs in the background, one image at a time; press Esc to stop after the current
     @staticmethod
     def compute(job):
         s = job["settings"]
-        return encode_maps(add_engine_maps(image_arrays(job["rgb"], s), s.pack_maps))
+        arrays = add_engine_maps(image_arrays(job["rgb"], s), s.pack_maps)
+        write_extra_sizes(job["base"], arrays, s)
+        return encode_maps(arrays)
 
     def create(self, context, job, encoded):
         maps = images_from_encoded(job["base"], encoded, job["out_dir"], self.replace)
@@ -3519,6 +3886,897 @@ as a preset you can load again in any project"""
     preset_subdir = PRESET_SUBDIR
     preset_defines = ["p = bpy.context.scene.pbrgen"]
     preset_values = []  # filled in at register(), once the settings exist
+
+
+# ---------------------------------------------------------------------------
+# Variations grid
+# ---------------------------------------------------------------------------
+
+_variations = {"items": [], "params": [], "busy": False}
+
+
+def _variation_items(self, context):
+    return _variations["items"] or [("NONE", "No variations yet", "Press Show Variations", 0, 0)]
+
+
+def _apply_variation(self, context):
+    if self.variation_pick == "NONE" or not _variations["params"]:
+        return
+    i = int(self.variation_pick)
+    params = _variations["params"][i]
+    for key, value in params.items():
+        setattr(self, key, value)
+
+
+def thumbnail_from_arrays(arrays, size):
+    """Quick lit look of the maps (no render): color x light from the normal map x AO."""
+    n = arrays["normal"] * 2 - 1
+    light = np.array([-0.45, 0.45, 0.77], np.float32)
+    lam = np.clip((n * light).sum(-1), 0, 1)
+    img = np.clip(arrays["albedo"], 0, 1) * (0.35 + 0.75 * lam[..., None]) * (0.6 + 0.4 * arrays["ao"][..., None])
+    img = _resize(np.clip(img, 0, 1).astype(np.float32), size)
+    return np.dstack([img, np.ones(img.shape[:2], np.float32)])
+
+
+def _jitter_color(c, rng, amount=0.08):
+    import colorsys
+    h, s, v = colorsys.rgb_to_hsv(*c)
+    h = (h + rng.uniform(-0.25, 0.25) * amount) % 1.0
+    s = min(1.0, max(0.0, s * (1 + rng.uniform(-1.5, 1.5) * amount)))
+    v = min(1.0, max(0.0, v * (1 + rng.uniform(-1.2, 1.2) * amount)))
+    return tuple(colorsys.hsv_to_rgb(h, s, v))
+
+
+class PBRGEN_OT_variations(bpy.types.Operator):
+    """Make 9 variations of the current texture (different random seeds and slightly \
+different colors) to pick from. The first one is what you have now"""
+    bl_idname = "pbrgen.variations"
+    bl_label = "Show Variations"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        if _variations["busy"]:
+            return {"CANCELLED"}
+        p = context.scene.pbrgen
+        base = snapshot_settings(p)
+        rng = np.random.default_rng()
+        params = []
+        for i in range(9):
+            if i == 0:
+                params.append({"tex_seed": p.tex_seed, "tex_color1": tuple(p.tex_color1),
+                               "tex_color2": tuple(p.tex_color2), "tex_gap_color": tuple(p.tex_gap_color)})
+            else:
+                params.append({"tex_seed": int(rng.integers(1, 99999)),
+                               "tex_color1": _jitter_color(tuple(p.tex_color1), rng),
+                               "tex_color2": _jitter_color(tuple(p.tex_color2), rng),
+                               "tex_gap_color": _jitter_color(tuple(p.tex_gap_color), rng, 0.05)})
+        state = {"done": False, "thumbs": None, "error": None}
+
+        def run():
+            try:
+                thumbs = []
+                for prm in params:
+                    s = SimpleNamespace(**vars(base))
+                    for k, v in prm.items():
+                        setattr(s, k, v)
+                    thumbs.append(thumbnail_from_arrays(procedural_arrays(s, 256), 192))
+                state["thumbs"] = thumbs
+            except Exception as e:  # noqa: BLE001
+                state["error"] = e
+            finally:
+                state["done"] = True
+
+        def finish_up():
+            if not state["done"]:
+                return 0.05
+            _variations["busy"] = False
+            if state["error"] is not None:
+                print("PBR Map Generator: variations failed:", state["error"])
+                return None
+            pcoll = preview_collections["variations"]
+            pcoll.clear()
+            items = []
+            for i, t in enumerate(state["thumbs"]):
+                icon = pcoll.new("var%d" % i)
+                icon.image_size = (t.shape[1], t.shape[0])
+                icon.image_pixels_float.foreach_set(t.ravel())
+                items.append((str(i), "Current" if i == 0 else "Variation %d" % i,
+                              "Keep the current look" if i == 0 else "Use this seed and these colors",
+                              icon.icon_id, i))
+            _variations["items"], _variations["params"] = items, params
+            _redraw_sidebars()
+            return None
+
+        _variations["busy"] = True
+        if bpy.app.background:
+            run()
+            finish_up()
+        else:
+            threading.Thread(target=run, daemon=True, name="pbrgen-variations").start()
+            bpy.app.timers.register(finish_up, first_interval=0.05)
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Colors from a photo
+# ---------------------------------------------------------------------------
+
+def dominant_colors(rgb, k=4, iters=12, seed=0):
+    """The k main colors of an image (k-means), most common first: [(color, share)]."""
+    px = rgb.reshape(-1, 3).astype(np.float32)
+    rng = np.random.default_rng(seed)
+    if len(px) > 20000:
+        px = px[rng.choice(len(px), 20000, replace=False)]
+    centers = px[rng.choice(len(px), k, replace=False)]
+    for _ in range(iters):
+        d = ((px[:, None, :] - centers[None]) ** 2).sum(-1)
+        lab = d.argmin(1)
+        for j in range(k):
+            sel = px[lab == j]
+            if len(sel):
+                centers[j] = sel.mean(0)
+    counts = np.bincount(lab, minlength=k)
+    order = np.argsort(-counts)
+    return [(tuple(float(c) for c in centers[j]), counts[j] / len(px)) for j in order]
+
+
+class PBRGEN_OT_match_colors(bpy.types.Operator):
+    """Set the pattern's colors from a photo: the most common color becomes Color, \
+the next one Color 2, and the darkest the gap color"""
+    bl_idname = "pbrgen.match_colors"
+    bl_label = "Match Colors"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        p = context.scene.pbrgen
+        img = p.color_ref_image
+        if img is None:
+            self.report({"ERROR"}, "Pick a reference image first")
+            return {"CANCELLED"}
+        try:
+            cols = dominant_colors(read_rgb(img, 256))
+        except Exception as e:  # noqa: BLE001
+            self.report({"ERROR"}, "Could not read the image: %s" % e)
+            return {"CANCELLED"}
+        main = [c for c, _s in cols]
+        p.tex_color1 = main[0]
+        p.tex_color2 = main[1]
+        if "gap_color" in PATTERN_UI[p.tex_pattern][0]:
+            p.tex_gap_color = min(main, key=lambda c: sum(c))
+        self.report({"INFO"}, "Colors matched to '%s'" % img.name)
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Blend two materials
+# ---------------------------------------------------------------------------
+
+def copy_node_tree(src, dst, offset=(0, 0)):
+    """Copy every node and link of one shader node tree into another.
+    Returns {source node name: new node}."""
+    made = {}
+    skip = {"rna_type", "name", "location", "width", "height", "dimensions", "type", "inputs", "outputs",
+            "internal_links", "parent", "select", "is_active_output", "bl_idname", "bl_label",
+            "bl_description", "bl_icon", "bl_static_type", "bl_width_default", "bl_width_min",
+            "bl_width_max", "bl_height_default", "bl_height_min", "bl_height_max", "warning_propagation"}
+    for n in src.nodes:
+        if n.bl_idname == "ShaderNodeOutputMaterial":
+            continue
+        m = dst.nodes.new(n.bl_idname)
+        m.location = (n.location.x + offset[0], n.location.y + offset[1])
+        m.label = n.label
+        for prop in n.bl_rna.properties:
+            ident = prop.identifier
+            if ident in skip or prop.is_readonly:
+                continue
+            try:
+                setattr(m, ident, getattr(n, ident))
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                pass
+        for i, s in enumerate(n.inputs):
+            if hasattr(s, "default_value") and i < len(m.inputs):
+                try:
+                    m.inputs[i].default_value = s.default_value
+                except (AttributeError, TypeError, ValueError):
+                    pass
+        made[n.name] = m
+    for link in src.links:
+        a, b = made.get(link.from_node.name), made.get(link.to_node.name)
+        if a is None or b is None:
+            continue
+        fi = list(link.from_node.outputs).index(link.from_socket)
+        ti = list(link.to_node.inputs).index(link.to_socket)
+        dst.links.new(a.outputs[fi], b.inputs[ti])
+    return made
+
+
+def _output_links(mat):
+    out = next((n for n in mat.node_tree.nodes if n.bl_idname == "ShaderNodeOutputMaterial"), None)
+    if out is None:
+        return None, None
+    surf = out.inputs["Surface"].links[0].from_node if out.inputs["Surface"].is_linked else None
+    disp = out.inputs["Displacement"].links[0].from_node if out.inputs["Displacement"].is_linked else None
+    return surf, disp
+
+
+def _height_socket(made, mat):
+    for n in mat.node_tree.nodes:
+        if n.bl_idname == "ShaderNodeTexImage" and n.label == "Height / Bump":
+            return made[n.name].outputs["Color"]
+    return None
+
+
+BLEND_ATTR = "PBR Blend"
+
+
+class PBRGEN_OT_blend_materials(bpy.types.Operator):
+    """Make a new material that mixes Material A and Material B, using a noise pattern \
+or a mask you paint on the object (Vertex Paint), optionally filling low areas of A first"""
+    bl_idname = "pbrgen.blend_materials"
+    bl_label = "Blend Materials"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        p = context.scene.pbrgen
+        a, b = p.blend_a, p.blend_b
+        if a is None or b is None or not a.node_tree or not b.node_tree:
+            self.report({"ERROR"}, "Choose two materials (made with node trees) to blend")
+            return {"CANCELLED"}
+        if a == b:
+            self.report({"ERROR"}, "Choose two different materials")
+            return {"CANCELLED"}
+        mat = bpy.data.materials.new("%s_%s_Blend" % (a.name.replace("_PBR", ""), b.name.replace("_PBR", "")))
+        try:
+            mat.use_nodes = True
+        except AttributeError:
+            pass
+        nt = mat.node_tree
+        nt.nodes.clear()
+        made_a = copy_node_tree(a.node_tree, nt, (0, 0))
+        made_b = copy_node_tree(b.node_tree, nt, (0, -2200))
+        sa, da = _output_links(a)
+        sb, db = _output_links(b)
+        if sa is None or sb is None:
+            bpy.data.materials.remove(mat)
+            self.report({"ERROR"}, "Both materials need a surface shader")
+            return {"CANCELLED"}
+        out = nt.nodes.new("ShaderNodeOutputMaterial")
+        out.location = (2200, -1000)
+        mix = nt.nodes.new("ShaderNodeMixShader")
+        mix.location = (1900, -1000)
+        nt.links.new(made_a[sa.name].outputs[0], mix.inputs[1])
+        nt.links.new(made_b[sb.name].outputs[0], mix.inputs[2])
+        nt.links.new(mix.outputs[0], out.inputs["Surface"])
+
+        # The mask: 0 shows A, 1 shows B.
+        if p.blend_mask == "PAINT":
+            src = nt.nodes.new("ShaderNodeVertexColor")
+            src.layer_name = BLEND_ATTR
+            src.label = "Painted Mask (Vertex Paint: white = B)"
+            mask = src.outputs["Color"]
+        else:
+            coord = nt.nodes.new("ShaderNodeTexCoord")
+            coord.location = (900, -800)
+            src = nt.nodes.new("ShaderNodeTexNoise")
+            src.inputs["Scale"].default_value = p.blend_scale
+            src.inputs["Detail"].default_value = 4.0
+            nt.links.new(coord.outputs["Object"], src.inputs["Vector"])
+            mask = src.outputs["Fac"]
+        src.location = (1100, -800)
+        amount = nt.nodes.new("ShaderNodeMath")
+        amount.operation = "ADD"
+        amount.location = (1300, -800)
+        nt.links.new(mask, amount.inputs[0])
+        amount.inputs[1].default_value = (p.blend_amount - 0.5) * (1.0 if p.blend_mask == "NOISE" else 0.0)
+        mask = amount.outputs[0]
+        ha = _height_socket(made_a, a)
+        if p.blend_use_height and ha is not None:
+            # B settles into the low parts of A first (mud in cracks, moss in gaps).
+            low = nt.nodes.new("ShaderNodeMath")
+            low.operation = "MULTIPLY_ADD"
+            low.location = (1300, -1000)
+            nt.links.new(ha, low.inputs[0])
+            low.inputs[1].default_value = -0.8
+            nt.links.new(mask, low.inputs[2])
+            add = nt.nodes.new("ShaderNodeMath")
+            add.operation = "ADD"
+            add.location = (1450, -1000)
+            nt.links.new(low.outputs[0], add.inputs[0])
+            add.inputs[1].default_value = 0.4
+            mask = add.outputs[0]
+        ramp = nt.nodes.new("ShaderNodeMapRange")
+        ramp.location = (1650, -900)
+        half = 0.5 / max(1.0, p.blend_sharpness)
+        ramp.inputs["From Min"].default_value = 0.5 - half
+        ramp.inputs["From Max"].default_value = 0.5 + half
+        nt.links.new(mask, ramp.inputs["Value"])
+        nt.links.new(ramp.outputs["Result"], mix.inputs[0])
+
+        if da is not None or db is not None:
+            dmix = nt.nodes.new("ShaderNodeMix")
+            dmix.data_type = "VECTOR"
+            dmix.location = (1900, -1300)
+            nt.links.new(ramp.outputs["Result"], dmix.inputs[0])
+            if da is not None:
+                nt.links.new(made_a[da.name].outputs[0], _socket(dmix.inputs, "A_Vector", 4))
+            if db is not None:
+                nt.links.new(made_b[db.name].outputs[0], _socket(dmix.inputs, "B_Vector", 5))
+            nt.links.new(_socket(dmix.outputs, "Result_Vector", 1), out.inputs["Displacement"])
+            if hasattr(mat, "displacement_method"):
+                mat.displacement_method = a.displacement_method
+
+        msg = "Made '%s'" % mat.name
+        if p.assign_to_active and assign_to_active(context, mat):
+            obj = context.active_object
+            msg += " on '%s'" % obj.name
+            if p.blend_mask == "PAINT" and obj.type == "MESH":
+                attrs = obj.data.color_attributes
+                if BLEND_ATTR not in attrs:
+                    ca = attrs.new(BLEND_ATTR, "BYTE_COLOR", "POINT")
+                    ca.data.foreach_set("color", np.tile(np.array([0, 0, 0, 1], np.float32), len(ca.data)))
+                attrs.active_color = attrs[BLEND_ATTR]
+                msg += ". Paint white in Vertex Paint mode where you want '%s'" % b.name
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Edge map (curvature) for model-aware wear
+# ---------------------------------------------------------------------------
+
+class PBRGEN_OT_update_edge_map(bpy.types.Operator):
+    """Re-measure the selected objects' sharp edges for Model Edge Wear. \
+Do this after you change a model's shape"""
+    bl_idname = "pbrgen.update_edge_map"
+    bl_label = "Update Edge Map"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        done = 0
+        for obj in context.selected_objects or ([context.active_object] if context.active_object else []):
+            if obj.type == "MESH" and compute_curvature(obj.data):
+                done += 1
+        self.report({"INFO"}, "Edge map updated on %d object%s" % (done, "" if done == 1 else "s"))
+        return {"FINISHED"} if done else {"CANCELLED"}
+
+
+# ---------------------------------------------------------------------------
+# Height to real geometry
+# ---------------------------------------------------------------------------
+
+def _sample_bilinear(img, u, v):
+    """Sample a (H, W) array at repeat-wrapped coordinates (row 0 = bottom, like Blender)."""
+    h, w = img.shape
+    x = (u % 1.0) * w - 0.5
+    y = (v % 1.0) * h - 0.5
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    fx, fy = x - x0, y - y0
+    x0 %= w
+    y0 %= h
+    x1, y1 = (x0 + 1) % w, (y0 + 1) % h
+    top = img[y0, x0] * (1 - fx) + img[y0, x1] * fx
+    bot = img[y1, x0] * (1 - fx) + img[y1, x1] * fx
+    return top * (1 - fy) + bot * fy
+
+
+def box_projection_weights(nor, blend):
+    """How much each of the X, Y and Z sides counts for each normal: the same rule
+    Blender's Image Texture node uses for Box projection with this Blend value."""
+    n = np.abs(nor).astype(np.float64)
+    n /= np.maximum(n.sum(1, keepdims=True), 1e-12)
+    x, y, z = n[:, 0], n[:, 1], n[:, 2]
+    w = np.zeros_like(n)
+    if blend <= 0:
+        w[np.arange(len(n)), n.argmax(1)] = 1.0
+        return w
+    limit = 0.5 * (1.0 + blend)
+    done = np.zeros(len(n), bool)
+
+    def case(mask, values):
+        nonlocal done
+        m = mask & ~done
+        for i, v in enumerate(values):
+            w[m, i] = v[m] if isinstance(v, np.ndarray) else v
+        done |= m
+
+    one = np.ones(len(n))
+    zero = np.zeros(len(n))
+    case((x > limit * (x + y)) & (x > limit * (x + z)), (one, zero, zero))
+    case((y > limit * (x + y)) & (y > limit * (y + z)), (zero, one, zero))
+    case((z > limit * (x + z)) & (z > limit * (y + z)), (zero, zero, one))
+    wx = np.clip((x / np.maximum(x + y, 1e-12) - 0.5 * (1 - blend)) / blend, 0, 1)
+    case(z < (1 - limit) * (y + x), (wx, 1 - wx, zero))
+    wy = np.clip((y / np.maximum(y + z, 1e-12) - 0.5 * (1 - blend)) / blend, 0, 1)
+    case(x < (1 - limit) * (y + z), (zero, wy, 1 - wy))
+    wx2 = np.clip((x / np.maximum(x + z, 1e-12) - 0.5 * (1 - blend)) / blend, 0, 1)
+    case(y < (1 - limit) * (x + z), (wx2, zero, 1 - wx2))
+    k = 2.0 * limit - 1.0
+    case(~done, (((2 - limit) * x + (limit - 1)) / k, ((2 - limit) * y + (limit - 1)) / k,
+                 ((2 - limit) * z + (limit - 1)) / k))
+    return w
+
+
+def displacement_heights(mesh, mat):
+    """Height (0..1) at every vertex, read from the material's height map the same way
+    the material maps it (Box projection or UVs). None if the material has no height map."""
+    nodes = mat.node_tree.nodes
+    hnode = next((n for n in nodes if n.bl_idname == "ShaderNodeTexImage" and n.label == "Height / Bump"), None)
+    mapping = next((n for n in nodes if n.bl_idname == "ShaderNodeMapping" and not n.label), None)
+    if hnode is None or hnode.image is None or mapping is None:
+        return None
+    img = image_to_array(hnode.image)[..., 0].astype(np.float32)
+    scale = np.array(mapping.inputs["Scale"].default_value, np.float32)
+    loc = np.array(mapping.inputs["Location"].default_value, np.float32)
+    n = len(mesh.vertices)
+    co = np.empty(n * 3, np.float32)
+    mesh.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3)
+    if hnode.projection == "BOX":
+        nor = np.empty(n * 3, np.float32)
+        try:
+            mesh.vertex_normals.foreach_get("vector", nor)
+        except AttributeError:
+            mesh.vertices.foreach_get("normal", nor)
+        nor = nor.reshape(-1, 3)
+        q = co * scale + loc
+        wts = box_projection_weights(nor, hnode.projection_blend)
+        hx = _sample_bilinear(img, np.where(nor[:, 0] < 0, 1 - q[:, 1], q[:, 1]), q[:, 2])
+        hy = _sample_bilinear(img, np.where(nor[:, 1] > 0, 1 - q[:, 0], q[:, 0]), q[:, 2])
+        hz = _sample_bilinear(img, np.where(nor[:, 2] > 0, 1 - q[:, 1], q[:, 1]), q[:, 0])
+        return hx * wts[:, 0] + hy * wts[:, 1] + hz * wts[:, 2], None
+    uvl = mesh.uv_layers.active
+    if uvl is None:
+        return None
+    uv = np.empty(len(mesh.loops) * 2, np.float32)
+    uvl.data.foreach_get("uv", uv)
+    uv = uv.reshape(-1, 2) * scale[:2] + loc[:2]
+    lv = np.empty(len(mesh.loops), np.int64)
+    mesh.loops.foreach_get("vertex_index", lv)
+    hl = _sample_bilinear(img, uv[:, 0], uv[:, 1])
+    total = np.zeros(n)
+    cnt = np.zeros(n)
+    np.add.at(total, lv, hl)
+    np.add.at(cnt, lv, 1)
+    return total / np.maximum(cnt, 1), None
+
+
+class PBRGEN_OT_height_to_geometry(bpy.types.Operator):
+    """Turn the active object's height map into real geometry: makes a displaced copy \
+of the object (subdivided first) that exports to games and other apps exactly as it looks. \
+The original is hidden, not deleted"""
+    bl_idname = "pbrgen.height_to_geometry"
+    bl_label = "Height to Geometry"
+    bl_options = {"REGISTER", "UNDO"}
+
+    levels: IntProperty(name="Subdivision Levels", default=4, min=0, max=7,
+                        description="How finely to split the faces before moving them. More = finer detail")
+    strength: FloatProperty(name="Depth", default=0.05, min=0.0, soft_max=1.0, unit="LENGTH",
+                            description="How far the highest bumps stand out from the lowest, in meters")
+
+    def invoke(self, context, event):
+        self.levels = context.scene.pbrgen.displacement_levels
+        self.strength = context.scene.pbrgen.displacement_scale
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        obj = context.active_object
+        mat = obj.active_material if obj is not None else None
+        if obj is None or obj.type != "MESH" or mat is None or not mat.node_tree:
+            self.report({"ERROR"}, "Select a mesh object with a PBR Map Generator material")
+            return {"CANCELLED"}
+        tmp = obj.modifiers.new("PBR Geo Subdivision", "SUBSURF")
+        tmp.subdivision_type = "SIMPLE"
+        tmp.levels = tmp.render_levels = self.levels
+        try:
+            dg = context.evaluated_depsgraph_get()
+            mesh = bpy.data.meshes.new_from_object(obj.evaluated_get(dg), preserve_all_data_layers=True, depsgraph=dg)
+        finally:
+            obj.modifiers.remove(tmp)
+        found = displacement_heights(mesh, mat)
+        if found is None:
+            bpy.data.meshes.remove(mesh)
+            self.report({"ERROR"}, "The active material has no height map from PBR Map Generator "
+                                   "(or uses UV mode on an object without UVs)")
+            return {"CANCELLED"}
+        heights, _ = found
+        n = len(mesh.vertices)
+        co = np.empty(n * 3, np.float32)
+        mesh.vertices.foreach_get("co", co)
+        nor = np.empty(n * 3, np.float32)
+        try:
+            mesh.vertex_normals.foreach_get("vector", nor)
+        except AttributeError:
+            mesh.vertices.foreach_get("normal", nor)
+        co = co.reshape(-1, 3) + nor.reshape(-1, 3) * ((heights - 0.5) * self.strength)[:, None]
+        mesh.vertices.foreach_set("co", co.astype(np.float32).ravel())
+        mesh.update()
+        mesh.name = obj.data.name + "_Displaced"
+        new = bpy.data.objects.new(obj.name + "_Displaced", mesh)
+        new.matrix_world = obj.matrix_world
+        for coll in obj.users_collection:
+            coll.objects.link(new)
+        # The bumps are real now, so the copy's material must not displace again.
+        geo_mat = mat.copy()
+        geo_mat.name = mat.name + "_Geo"
+        out = next((nd for nd in geo_mat.node_tree.nodes if nd.bl_idname == "ShaderNodeOutputMaterial"), None)
+        if out is not None:
+            for link in list(out.inputs["Displacement"].links):
+                geo_mat.node_tree.links.remove(link)
+        for i, slot_mat in enumerate(mesh.materials):
+            if slot_mat == mat:
+                mesh.materials[i] = geo_mat
+        obj.hide_set(True)
+        obj.hide_render = True
+        for o in context.selected_objects:
+            o.select_set(False)
+        new.select_set(True)
+        context.view_layer.objects.active = new
+        self.report({"INFO"}, "Made '%s' (%d vertices). '%s' is hidden, not deleted"
+                    % (new.name, n, obj.name))
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Trim sheets
+# ---------------------------------------------------------------------------
+
+def _trim_items(self, context):
+    items = [("NONE", "(empty)", "Leave this strip out", 99)]
+    for heading, keys in PATTERN_GROUPS:
+        items.append(("", heading, ""))
+        for k in keys:
+            items.append((k, PATTERNS[k][0], PATTERN_TIPS[k], PATTERN_IDS[k]))
+    return items
+
+
+def trim_layout(p):
+    """[(pattern, v_start, v_end)] for the used strips, bottom to top, in 0..1."""
+    strips = [(getattr(p, "trim_pattern_%d" % i), getattr(p, "trim_size_%d" % i)) for i in range(1, 5)]
+    strips = [(k, s) for k, s in strips if k != "NONE"]
+    total = float(sum(s for _k, s in strips)) or 1.0
+    out, v = [], 0.0
+    for k, s in strips:
+        out.append((k, v, v + s / total))
+        v += s / total
+    return out
+
+
+def trim_sheet_arrays(settings, size, layout):
+    """One texture made of horizontal strips of different patterns (each using that
+    pattern's starting settings), with a small groove between strips."""
+    height = np.zeros((size, size), np.float32)
+    albedo = np.zeros((size, size, 3), np.float32)
+    rough = np.zeros((size, size), np.float32)
+    metal = np.zeros((size, size), np.float32)
+    rows = np.arange(size)
+    for key, v0, v1 in layout:
+        s = SimpleNamespace(**vars(settings))
+        s.tex_pattern = key
+        for name, value in PRESETS.get(key, {}).items():
+            setattr(s, "tex_" + name, value)
+        data = PATTERNS[key][1](s, size, np.random.default_rng(s.tex_seed))
+        r0, r1 = int(round(v0 * size)), int(round(v1 * size))
+        sl = slice(r0, r1)
+        height[sl] = np.clip(data["height"], 0, 1)[: r1 - r0]
+        albedo[sl] = np.clip(data["albedo"], 0, 1)[: r1 - r0]
+        rough[sl] = np.clip(data["rough"], 0, 1)[: r1 - r0]
+        if "metal" in data:
+            metal[sl] = np.clip(data["metal"], 0, 1)[: r1 - r0]
+    groove = max(1, size // 256)
+    for _key, v0, _v1 in layout[1:]:
+        r = int(round(v0 * size))
+        d = np.abs(rows - r + 0.5)
+        dip = np.clip(1.0 - d / (groove * 1.5), 0, 1)
+        height -= dip[:, None] * 0.3
+        albedo *= (1 - 0.5 * dip)[:, None, None]
+    height = np.clip(height, 0, 1)
+    normal = height_to_normal(height, settings.normal_strength * size / 1024.0 * 2.0, settings.directx_normal)
+    ao = height_to_ao(height, max(2, int(settings.ao_radius * size / 1024.0)), settings.ao_strength * 0.5)
+    arrays = {"albedo": albedo * (0.75 + 0.25 * ao[..., None]), "height": height, "normal": normal,
+              "roughness": rough, "ao": ao}
+    if metal.any():
+        arrays["metallic"] = metal
+    return arrays
+
+
+class PBRGEN_OT_trim_sheet(_ExistingChoice, bpy.types.Operator):
+    """Generate a trim sheet: one texture made of horizontal strips of different patterns. \
+Then select faces in Edit Mode and use the strip buttons to put them on a strip"""
+    bl_idname = "pbrgen.trim_sheet"
+    bl_label = "Generate Trim Sheet"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def material_name(self, context):
+        return "TrimSheet_PBR"
+
+    def execute(self, context):
+        p = context.scene.pbrgen
+        layout = trim_layout(p)
+        if not layout:
+            self.report({"ERROR"}, "Choose a pattern for at least one strip")
+            return {"CANCELLED"}
+        replace = self.use_replace(context)
+        settings = snapshot_settings(p)
+        size = int(p.tex_res)
+        out_dir = p.out_dir
+
+        def work(stage):
+            stage("making %d strips" % len(layout))
+            arrays = add_engine_maps(trim_sheet_arrays(settings, size, layout), settings.pack_maps)
+            write_extra_sizes("TrimSheet", arrays, settings)
+            stage("encoding images")
+            return encode_maps(arrays)
+
+        def done(encoded, context):
+            maps = images_from_encoded("TrimSheet", encoded, out_dir, replace)
+            finish(self, context, "TrimSheet_PBR", maps, context.scene.pbrgen, replace, projection="UV")
+
+        return self.start_job(context, "Trim Sheet %dpx" % size, work, done)
+
+
+class PBRGEN_OT_trim_assign(bpy.types.Operator):
+    """Fit the selected faces' UVs onto this strip of the trim sheet (keeping their proportions). \
+Unwrap the faces first (U), then press this"""
+    bl_idname = "pbrgen.trim_assign"
+    bl_label = "Put Selected Faces on Strip"
+    bl_options = {"REGISTER", "UNDO"}
+
+    strip: IntProperty(default=0)
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        layout = trim_layout(context.scene.pbrgen)
+        if self.strip >= len(layout):
+            return {"CANCELLED"}
+        _k, v0, v1 = layout[self.strip]
+        done = 0
+        for obj in context.objects_in_mode:
+            bm = bmesh.from_edit_mesh(obj.data)
+            uv = bm.loops.layers.uv.active or bm.loops.layers.uv.new()
+            loops = [l for f in bm.faces if f.select for l in f.loops]
+            if not loops:
+                continue
+            us = np.array([l[uv].uv.x for l in loops])
+            vs = np.array([l[uv].uv.y for l in loops])
+            span = vs.max() - vs.min()
+            if span < 1e-8:
+                span = max(us.max() - us.min(), 1e-8)
+            k = (v1 - v0) / span
+            for l, u, v in zip(loops, us, vs):
+                l[uv].uv = ((u - us.min()) * k, v0 + (v - vs.min()) * k)
+            bmesh.update_edit_mesh(obj.data)
+            done += 1
+        if not done:
+            self.report({"WARNING"}, "Select some faces first")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Several sizes at once
+# ---------------------------------------------------------------------------
+
+def downsample(a, n):
+    """Average-down a square map to n x n (sizes are powers of two)."""
+    f = a.shape[0] // n
+    if f <= 1:
+        return a
+    a = a[:n * f, :n * f]
+    shape = (n, f, n, f) + a.shape[2:]
+    return a.reshape(shape).mean(axis=(1, 3))
+
+
+def write_extra_sizes(base, arrays, settings):
+    """Also save smaller copies of every map into <Save Folder>/<size>px/ (worker thread safe)."""
+    sizes = sorted((int(s) for s in getattr(settings, "export_sizes", ())), reverse=True)
+    folder = getattr(settings, "_out_dir_abs", "")
+    if not sizes or not folder:
+        return
+    full = arrays["albedo"].shape[0]
+    for n in sizes:
+        if n >= full or arrays["albedo"].shape[0] != arrays["albedo"].shape[1]:
+            continue
+        small = {}
+        for key, arr in arrays.items():
+            s = downsample(arr, n)
+            if key == "normal":
+                v = s * 2 - 1
+                v /= np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-6)
+                s = v * 0.5 + 0.5
+            small[key] = s
+        sub = os.path.join(folder, "%dpx" % n)
+        os.makedirs(sub, exist_ok=True)
+        for key, data in encode_maps(small).items():
+            suffix = next(sfx for k, sfx, _nc in _MAP_SPEC if k == key)
+            with open(os.path.join(sub, base + suffix + ".png"), "wb") as f:
+                f.write(data)
+
+
+# ---------------------------------------------------------------------------
+# Poly Haven browser (free CC0 textures from polyhaven.com)
+# ---------------------------------------------------------------------------
+
+PH_API = "https://api.polyhaven.com"
+PH_UA = {"User-Agent": "Blender-PBR-Map-Generator/1.11"}
+PH_CACHE = os.path.join(tempfile.gettempdir(), "pbr_map_generator_polyhaven")
+_ph = {"assets": None, "items": [], "ids": [], "busy": "", "message": ""}
+
+
+def _ph_get(url, timeout=30):
+    req = urllib.request.Request(url, headers=PH_UA)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _ph_items(self, context):
+    return _ph["items"] or [("NONE", "No results", "Search Poly Haven first", 0, 0)]
+
+
+def ph_search_results(assets, text, category, limit=36):
+    words = [w for w in text.lower().split() if w]
+    found = []
+    for aid, a in assets.items():
+        if a.get("type") != 1:
+            continue
+        hay = " ".join([aid, a.get("name", "")] + a.get("tags", []) + a.get("categories", [])).lower()
+        if category != "ALL" and category.lower() not in [c.lower() for c in a.get("categories", [])]:
+            continue
+        if all(w in hay for w in words):
+            found.append((a.get("download_count", 0), aid))
+    found.sort(reverse=True)
+    return [aid for _n, aid in found[:limit]]
+
+
+def _online(op):
+    if not getattr(bpy.app, "online_access", True):
+        op.report({"ERROR"}, "Online access is disabled. Enable it in Preferences > System > Network")
+        return False
+    return True
+
+
+class PBRGEN_OT_ph_search(bpy.types.Operator):
+    """Search Poly Haven's free textures (CC0: free for any use, no credit needed)"""
+    bl_idname = "pbrgen.ph_search"
+    bl_label = "Search Poly Haven"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        if _ph["busy"] or not _online(self):
+            return {"CANCELLED"}
+        p = context.scene.pbrgen
+        text, category = p.ph_search, p.ph_category
+        state = {"done": False, "ids": [], "error": None}
+
+        def run():
+            try:
+                import json
+                if _ph["assets"] is None:
+                    _ph["assets"] = json.loads(_ph_get(PH_API + "/assets?t=textures"))
+                ids = ph_search_results(_ph["assets"], text, category)
+                os.makedirs(os.path.join(PH_CACHE, "thumbs"), exist_ok=True)
+
+                def thumb(aid):
+                    path = os.path.join(PH_CACHE, "thumbs", aid + ".png")
+                    if not os.path.isfile(path):
+                        data = _ph_get("https://cdn.polyhaven.com/asset_img/thumbs/%s.png?width=192&height=192" % aid)
+                        with open(path, "wb") as f:
+                            f.write(data)
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    list(ex.map(thumb, ids))
+                state["ids"] = ids
+            except Exception as e:  # noqa: BLE001
+                state["error"] = e
+            finally:
+                state["done"] = True
+
+        def finish_up():
+            if not state["done"]:
+                return 0.1
+            _ph["busy"] = ""
+            if state["error"] is not None:
+                _ph["message"] = "Search failed: %s" % state["error"]
+                _redraw_sidebars()
+                return None
+            pcoll = preview_collections["polyhaven"]
+            items = []
+            for i, aid in enumerate(state["ids"]):
+                path = os.path.join(PH_CACHE, "thumbs", aid + ".png")
+                icon = pcoll.get(aid) or pcoll.load(aid, path, "IMAGE")
+                a = _ph["assets"][aid]
+                items.append((aid, a.get("name", aid), a.get("description", "")[:200] or a.get("name", aid),
+                              icon.icon_id, i))
+            _ph["items"], _ph["ids"] = items, state["ids"]
+            _ph["message"] = "%d texture%s found" % (len(items), "" if len(items) == 1 else "s") if items \
+                else "Nothing found, try another word"
+            if items:
+                bpy.context.scene.pbrgen.ph_pick = items[0][0]
+            _redraw_sidebars()
+            return None
+
+        _ph["busy"] = "Searching..."
+        _ph["message"] = ""
+        if bpy.app.background:
+            run()
+            finish_up()
+        else:
+            threading.Thread(target=run, daemon=True, name="pbrgen-polyhaven").start()
+            bpy.app.timers.register(finish_up, first_interval=0.1)
+        return {"FINISHED"}
+
+
+PH_MAPS = (("albedo", "Diffuse", "jpg"), ("normal", "nor_gl", "png"), ("roughness", "Rough", "jpg"),
+           ("height", "Displacement", "png"), ("ao", "AO", "jpg"), ("metallic", "Metal", "jpg"))
+
+
+class PBRGEN_OT_ph_download(_ExistingChoice, bpy.types.Operator):
+    """Download the chosen Poly Haven texture's maps and build a material from them \
+(same material setup as the generated ones)"""
+    bl_idname = "pbrgen.ph_download"
+    bl_label = "Download Texture"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def material_name(self, context):
+        pick = context.scene.pbrgen.ph_pick
+        return pick + "_PBR" if pick and pick != "NONE" else ""
+
+    def execute(self, context):
+        p = context.scene.pbrgen
+        aid = p.ph_pick
+        if not aid or aid == "NONE" or _ph["assets"] is None or aid not in _ph["assets"]:
+            self.report({"ERROR"}, "Search and pick a texture first")
+            return {"CANCELLED"}
+        if _JOB["running"] or not _online(self):
+            return {"CANCELLED"}
+        replace = self.use_replace(context)
+        res = p.ph_resolution
+        folder = bpy.path.abspath(p.out_dir) if p.out_dir else os.path.join(PH_CACHE, "textures", aid, res)
+        dims = _ph["assets"][aid].get("dimensions") or []
+        real = (max(dims) / 1000.0) if dims else None
+
+        def work(stage):
+            import json
+            stage("finding files")
+            files = json.loads(_ph_get(PH_API + "/files/" + aid))
+            os.makedirs(folder, exist_ok=True)
+            got = {}
+            for key, kind, fmt in PH_MAPS:
+                entry = files.get(kind, {}).get(res, {})
+                f = entry.get(fmt) or entry.get("jpg") or entry.get("png")
+                if not f:
+                    continue
+                stage("downloading %s" % kind)
+                path = os.path.join(folder, os.path.basename(urllib.parse.urlparse(f["url"]).path))
+                if not os.path.isfile(path) or os.path.getsize(path) != f.get("size", -1):
+                    data = _ph_get(f["url"], timeout=120)
+                    with open(path, "wb") as out:
+                        out.write(data)
+                got[key] = path
+            if not {"albedo", "normal", "roughness"} <= set(got):
+                raise RuntimeError("this texture is missing some maps at %s" % res)
+            return got
+
+        def done(paths, context):
+            maps = {}
+            for key, path in paths.items():
+                img = bpy.data.images.load(path, check_existing=True)
+                img.colorspace_settings.name = "sRGB" if key == "albedo" else "Non-Color"
+                if not p.out_dir:
+                    img.pack()  # the download cache can be cleared; keep the maps in the .blend
+                maps[key] = img
+            if "height" not in maps:
+                maps["height"] = maps["roughness"]
+            if "ao" not in maps:
+                white = bpy.data.images.new(aid + "_AO", 4, 4)
+                white.pixels.foreach_set(np.ones(64, np.float32))
+                white.pack()
+                maps["ao"] = white
+            finish(self, context, aid + "_PBR", maps, context.scene.pbrgen, replace, real_size=real)
+
+        return self.start_job(context, "%s (%s)" % (_ph["assets"][aid].get("name", aid), res), work, done)
 
 
 class PBRGEN_OT_preview(bpy.types.Operator):
@@ -3934,7 +5192,14 @@ class PBRGEN_PT_procedural(PBRGEN_PT_base, bpy.types.Panel):
                     col.prop(p, "tex_" + k, text=labels[k])
                 else:
                     col.prop(p, "tex_" + k)
-        layout.prop(p, "tex_seed")
+        row = layout.row(align=True)
+        row.prop(p, "color_ref_image", text="", icon="EYEDROPPER")
+        row.operator("pbrgen.match_colors", text="Match Colors", icon="COLOR")
+        row = layout.row(align=True)
+        row.prop(p, "tex_seed")
+        row.operator("pbrgen.variations", text="Variations", icon="IMGDISPLAY")
+        if _variations["items"]:
+            layout.template_icon_view(p, "variation_pick", show_labels=True, scale=6.0, scale_popup=5.0)
         layout.operator("pbrgen.procedural", icon="TEXTURE")
 
 
@@ -3959,6 +5224,87 @@ class PBRGEN_PT_weathering(PBRGEN_PT_base, bpy.types.Panel):
         col.prop(p, "weather_edges", slider=True)
 
 
+class PBRGEN_PT_trim(PBRGEN_PT_base, bpy.types.Panel):
+    bl_label = "Trim Sheet"
+    bl_idname = "PBRGEN_PT_trim"
+    bl_parent_id = "PBRGEN_PT_procedural"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon="SEQ_STRIP_DUPLICATE")
+
+    def draw(self, context):
+        p = context.scene.pbrgen
+        layout = self.layout
+        layout.label(text="Strips, bottom to top:")
+        col = layout.column(align=True)
+        for i in range(4, 0, -1):
+            row = col.row(align=True)
+            row.prop(p, "trim_pattern_%d" % i, text="")
+            sub = row.row(align=True)
+            sub.active = getattr(p, "trim_pattern_%d" % i) != "NONE"
+            sub.prop(p, "trim_size_%d" % i, text="")
+        layout.operator("pbrgen.trim_sheet", icon="TEXTURE")
+        strips = trim_layout(p)
+        if context.mode == "EDIT_MESH" and strips:
+            layout.label(text="Put selected faces on:")
+            row = layout.row(align=True)
+            for i, (key, _v0, _v1) in enumerate(strips):
+                row.operator("pbrgen.trim_assign", text=PATTERNS[key][0]).strip = i
+        else:
+            layout.label(text="In Edit Mode, put faces on a strip here", icon="INFO")
+
+
+class PBRGEN_PT_blend(PBRGEN_PT_base, bpy.types.Panel):
+    bl_label = "Blend Materials"
+    bl_idname = "PBRGEN_PT_blend"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        p = context.scene.pbrgen
+        sync_viewport_overlay(context)
+        layout = self.layout
+        layout.prop(p, "blend_a")
+        layout.prop(p, "blend_b")
+        layout.row().prop(p, "blend_mask", expand=True)
+        col = layout.column(align=True)
+        if p.blend_mask == "NOISE":
+            col.prop(p, "blend_amount", slider=True)
+            col.prop(p, "blend_scale")
+        col.prop(p, "blend_sharpness")
+        layout.prop(p, "blend_use_height")
+        layout.operator("pbrgen.blend_materials", icon="NODE_MATERIAL")
+
+
+class PBRGEN_PT_polyhaven(PBRGEN_PT_base, bpy.types.Panel):
+    bl_label = "Poly Haven Textures"
+    bl_idname = "PBRGEN_PT_polyhaven"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        p = context.scene.pbrgen
+        sync_viewport_overlay(context)
+        layout = self.layout
+        row = layout.row(align=True)
+        row.prop(p, "ph_search", text="", icon="VIEWZOOM")
+        row.operator("pbrgen.ph_search", text="", icon="VIEWZOOM")
+        layout.prop(p, "ph_category")
+        if _ph["busy"]:
+            layout.label(text=_ph["busy"], icon="TIME")
+        elif _ph["message"]:
+            layout.label(text=_ph["message"], icon="INFO")
+        if _ph["items"]:
+            layout.template_icon_view(p, "ph_pick", show_labels=True, scale=6.0, scale_popup=4.0)
+            a = (_ph["assets"] or {}).get(p.ph_pick)
+            if a:
+                dims = a.get("dimensions") or []
+                if dims:
+                    layout.label(text="%s, real size %s" % (a.get("name", ""), _metres(max(dims) / 1000.0)))
+            layout.prop(p, "ph_resolution")
+            layout.operator("pbrgen.ph_download", icon="IMPORT")
+        layout.label(text="Free CC0 textures from polyhaven.com", icon="URL")
+
+
 class PBRGEN_PT_output(PBRGEN_PT_base, bpy.types.Panel):
     bl_label = "Output Settings"
     bl_idname = "PBRGEN_PT_output"
@@ -3976,7 +5322,25 @@ class PBRGEN_PT_output(PBRGEN_PT_base, bpy.types.Panel):
         layout.prop(p, "ao_strength")
         layout.prop(p, "ao_radius")
         layout.separator()
-        layout.prop(p, "tiling")
+        layout.row().prop(p, "size_mode", expand=True)
+        if p.size_mode == "REAL":
+            layout.prop(p, "real_size")
+            fields = PATTERN_UI.get(p.tex_pattern, ([], {}))[0]
+            if "count_x" in fields and p.tex_count_x > 0:
+                layout.label(text="Each piece is about %s across" % _metres(p.real_size / p.tex_count_x),
+                             icon="INFO")
+        else:
+            layout.prop(p, "tiling")
+        row = layout.row(align=True)
+        row.prop(p, "anti_tiling", toggle=True, icon="MOD_NOISE")
+        sub = row.row(align=True)
+        sub.active = p.anti_tiling
+        sub.prop(p, "anti_tiling_amount")
+        col = layout.column(align=True)
+        col.prop(p, "object_edge_wear", slider=True)
+        col.prop(p, "object_dirt", slider=True)
+        if p.object_edge_wear > 0:
+            col.operator("pbrgen.update_edge_map", icon="MOD_EDGESPLIT")
         layout.prop(p, "ao_mix")
         layout.prop(p, "use_displacement")
         if p.use_displacement:
@@ -3989,11 +5353,15 @@ class PBRGEN_PT_output(PBRGEN_PT_base, bpy.types.Panel):
             sub.prop(p, "displacement_levels")
             if context.scene.render.engine not in ("CYCLES",):
                 col.label(text="Shows best when rendered in Cycles", icon="INFO")
+            col.operator("pbrgen.height_to_geometry", icon="MOD_DISPLACE")
         layout.prop(p, "assign_to_active")
         layout.prop(p, "on_existing")
         layout.prop(p, "mark_as_asset")
         layout.prop(p, "pack_maps")
         layout.prop(p, "out_dir")
+        row = layout.row(align=True)
+        row.active = bool(p.out_dir)
+        row.prop(p, "export_sizes", expand=True)
 
 
 classes = (
@@ -4001,6 +5369,15 @@ classes = (
     PBRGEN_OT_from_image,
     PBRGEN_OT_procedural,
     PBRGEN_OT_batch_folder,
+    PBRGEN_OT_variations,
+    PBRGEN_OT_match_colors,
+    PBRGEN_OT_blend_materials,
+    PBRGEN_OT_update_edge_map,
+    PBRGEN_OT_height_to_geometry,
+    PBRGEN_OT_trim_sheet,
+    PBRGEN_OT_trim_assign,
+    PBRGEN_OT_ph_search,
+    PBRGEN_OT_ph_download,
     PBRGEN_MT_tex_presets,
     PBRGEN_OT_add_tex_preset,
     PBRGEN_OT_preview,
@@ -4012,6 +5389,9 @@ classes = (
     PBRGEN_PT_image,
     PBRGEN_PT_procedural,
     PBRGEN_PT_weathering,
+    PBRGEN_PT_trim,
+    PBRGEN_PT_blend,
+    PBRGEN_PT_polyhaven,
     PBRGEN_PT_output,
 )
 
@@ -4023,7 +5403,8 @@ def register():
     import bpy.utils.previews
     clean_old_previews()
     atexit.register(remove_own_preview)
-    preview_collections["main"] = bpy.utils.previews.new()
+    for name in ("main", "variations", "polyhaven"):
+        preview_collections[name] = bpy.utils.previews.new()
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.pbrgen = PointerProperty(type=PBRGEN_Props)
@@ -4085,6 +5466,8 @@ def unregister():
     for pcoll in preview_collections.values():
         bpy.utils.previews.remove(pcoll)
     preview_collections.clear()
+    _variations["items"], _variations["params"] = [], []
+    _ph["items"], _ph["ids"] = [], []
 
 
 if __name__ == "__main__":
