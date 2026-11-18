@@ -1,0 +1,18 @@
+schema_version = "1.0.0"
+
+id = "pbr_map_generator"
+version = "1.6.0"
+name = "PBR Map Generator"
+tagline = "Make PBR maps from any image and generate procedural textures"
+maintainer = "PBR Map Generator"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+tags = ["Material"]
+
+[permissions]
+network = "Download source images from URLs you enter"
+files = "Load source images and save generated maps"

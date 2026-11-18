@@ -1,0 +1,21 @@
+schema_version = "1.0.0"
+
+id = "export_fixer"
+version = "1.0.1"
+name = "Export Fixer"
+tagline = "Fix scale, units and flipped normals before FBX or glTF export"
+maintainer = "Charlie Marshall"
+type = "add-on"
+
+tags = ["Import-Export", "Game Engine", "Pipeline"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 Charlie Marshall"]
+
+[permissions]
+files = "Write exported model files to the location you choose"
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "/.git/", "/*.zip", "/tests/"]

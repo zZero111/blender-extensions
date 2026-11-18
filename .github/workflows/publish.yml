@@ -1,0 +1,53 @@
+name: Publish extension repository
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      BLENDER_VERSION: 4.5.3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Blender
+        run: |
+          curl -sSL "https://download.blender.org/release/Blender4.5/blender-${BLENDER_VERSION}-linux-x64.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/blender-${BLENDER_VERSION}-linux-x64" >> "$GITHUB_PATH"
+
+      - name: Build extensions
+        run: |
+          mkdir -p site
+          for dir in extensions/*/; do
+            [ -f "$dir/blender_manifest.toml" ] || continue
+            blender --command extension build --source-dir "$dir" --output-dir site
+          done
+
+      - name: Generate repository index
+        run: blender --command extension server-generate --repo-dir site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
