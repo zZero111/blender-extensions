@@ -1,28 +1,33 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """
-PBR Map Generator for Blender.
+PBR Map Generator for Blender (4.2 and newer).
 
-* Turn any image (file on disk, image already in Blender, or a URL) into a set
-  of PBR maps: Base Color, Height/Bump, Normal, Roughness and Ambient Occlusion.
-* Generate procedural, seamlessly tiling textures (bricks, tiles, hex tiles,
-  wood planks, cobblestones, concrete, rock, metal plates, fabric) with the
-  same set of maps.
-* Builds a ready-to-use Principled BSDF material and can assign it to the
-  active object.
+* Turn any image (file, URL, image already in Blender, or a whole folder) into
+  PBR maps: Base Color, Height/Bump, Normal, Roughness and Ambient Occlusion,
+  optionally made seamless first.
+* Generate 28 procedural, seamlessly tiling textures (bricks, planks, tiles,
+  stone, metal, fabric, grass, scales and more) with optional weathering
+  (dirt, moss, rust streaks, worn edges), and save your own presets.
+* Builds a ready-to-use Principled BSDF material (with optional displacement),
+  can assign it to the active object, add it to the Asset Browser and save
+  channel-packed maps for Unreal, Godot and Unity.
+* Live preview on a choice of shapes or your selected object: drag to rotate,
+  scroll to zoom, double-click to reset, with studio, sun or HDRI lighting.
 
 Find it in the 3D Viewport sidebar (N key) under the "PBR Maps" tab.
 """
 
-bl_info = {
+bl_info = {  # only used by the old add-on system; blender_manifest.toml is what counts
     "name": "PBR Map Generator",
     "author": "PBR Map Generator",
-    "version": (1, 10, 0),
-    "blender": (3, 6, 0),
+    "version": (1, 10, 1),
+    "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > PBR Maps",
     "description": "Generate normal, bump, roughness and AO maps from images, plus procedural textures",
     "category": "Material",
 }
 
+import atexit
 import math
 import os
 import struct
@@ -2729,9 +2734,40 @@ def _frame_object(scene, cam, mesh, fill=0.8, matrix=None):
     cam.data.shift_y = k * ((max(ys) + min(ys)) / 2 - 0.5)
 
 
+PREVIEW_DIR = os.path.join(tempfile.gettempdir(), "pbr_map_generator_previews")
+
+
 def _next_preview_path():
     _preview_state["counter"] += 1
-    return os.path.join(tempfile.gettempdir(), "pbrgen_preview_%d.png" % _preview_state["counter"])
+    os.makedirs(PREVIEW_DIR, exist_ok=True)
+    return os.path.join(PREVIEW_DIR, "preview_%d_%d.png" % (os.getpid(), _preview_state["counter"]))
+
+
+def clean_old_previews(max_age_hours=12):
+    """Delete preview images left behind by earlier Blender sessions. Only old
+    files go, so a second Blender that's open right now keeps its preview."""
+    cutoff = time.time() - max_age_hours * 3600
+    old = [os.path.join(PREVIEW_DIR, f) for f in (os.listdir(PREVIEW_DIR) if os.path.isdir(PREVIEW_DIR) else [])]
+    tmp = tempfile.gettempdir()
+    old += [os.path.join(tmp, f) for f in os.listdir(tmp)  # files from versions before 1.10.1
+            if f.startswith("pbrgen_preview_") and f.endswith(".png")]
+    for path in old:
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def remove_own_preview():
+    """Delete this session's last preview image (when Blender quits or the add-on is turned off)."""
+    path = _preview_state.get("last_path")
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    _preview_state["last_path"] = ""
 
 
 def _resize(a, n):
@@ -3985,6 +4021,8 @@ addon_keymaps = []
 
 def register():
     import bpy.utils.previews
+    clean_old_previews()
+    atexit.register(remove_own_preview)
     preview_collections["main"] = bpy.utils.previews.new()
     for c in classes:
         bpy.utils.register_class(c)
@@ -4036,6 +4074,8 @@ def unregister():
     img = bpy.data.images.get(PREVIEW_IMAGE_NAME)
     if img is not None:
         bpy.data.images.remove(img)
+    remove_own_preview()
+    atexit.unregister(remove_own_preview)
     if bpy.app.timers.is_registered(_run_preview_timer):
         bpy.app.timers.unregister(_run_preview_timer)
     drop_live_rig()
