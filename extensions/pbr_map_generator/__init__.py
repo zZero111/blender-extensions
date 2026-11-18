@@ -1507,14 +1507,30 @@ def sidebar_preview_visible(area):
     return False
 
 
+def sidebar_on_addon(area):
+    """True when this 3D view's sidebar (N panel) is open on the PBR Maps tab."""
+    if not getattr(area.spaces.active, "show_region_ui", False):
+        return False
+    for r in area.regions:
+        if r.type == "UI" and r.width > 1:
+            return getattr(r, "active_panel_category", "PBR Maps") == "PBR Maps"
+    return False
+
+
+def viewport_preview_wanted(area):
+    """The viewport-corner preview only shows while you're using the add-on: the
+    sidebar is open on the PBR Maps tab but scrolled down past its own preview.
+    Close the sidebar (N) or switch tab and it disappears."""
+    return sidebar_on_addon(area) and not sidebar_preview_visible(area)
+
+
 def sync_viewport_overlay(context):
-    """Called while the sidebar draws (which includes scrolling). If the sidebar
-    preview just scrolled in or out of view, redraw the viewport so the corner
-    preview hides or shows to match."""
+    """Called whenever the sidebar redraws (scrolling, switching tab). If the corner
+    preview should now appear or disappear, redraw the viewport to match."""
     area = context.area
     if area is None or area.type != "VIEW_3D":
         return
-    visible = sidebar_preview_visible(area)
+    visible = viewport_preview_wanted(area)
     key = area.as_pointer()
     if _draw_state["visible"].get(key) == visible:
         return
@@ -1568,6 +1584,7 @@ def _note_sidebar_drawn():
     if region is not None:
         key = region.as_pointer()
         _draw_state["sidebar_image"][key] = _draw_state["sidebar_drawing"].pop(key, False)
+    sync_viewport_overlay(bpy.context)  # also runs on other tabs, where our panels don't draw
 
 
 def _draw_viewport_preview():
@@ -1580,9 +1597,11 @@ def _draw_viewport_preview():
     region, area = ctx.region, ctx.area
     if img is None or region is None or area is None:
         return
-    if sidebar_preview_visible(area):
+    if not viewport_preview_wanted(area):
+        # Sidebar closed or on another tab (not using the add-on), or the
+        # sidebar already shows the preview (don't show two).
         _draw_state["debug"]["overlay_drawn"] = False
-        return  # the sidebar already shows it; don't show two previews
+        return
     _draw_state["debug"]["overlay_drawn"] = True
     try:
         texture = gpu.texture.from_image(img)
@@ -1695,7 +1714,8 @@ class PBRGEN_Props(bpy.types.PropertyGroup):
     preview_in_viewport: BoolProperty(
         name="Show in Viewport", default=True, update=_redraw_viewports,
         description="Also show the preview in the bottom-right corner of the 3D viewport, "
-                    "so it stays visible while you scroll through the settings")
+                    "so it stays visible while you scroll through the settings. It only shows while "
+                    "the sidebar is open on the PBR Maps tab")
     preview_viewport_size: IntProperty(
         name="Viewport Preview Size", default=220, min=96, max=640, subtype="PIXEL", update=_redraw_viewports,
         description="How big the preview is in the corner of the 3D viewport")
@@ -2620,7 +2640,7 @@ class PBRGEN_OT_drag_preview(bpy.types.Operator):
         elif region.type == "WINDOW":
             if (not context.scene.pbrgen.preview_in_viewport
                     or bpy.data.images.get(PREVIEW_IMAGE_NAME) is None
-                    or sidebar_preview_visible(area)):
+                    or not viewport_preview_wanted(area)):
                 return False
             x0, y0, x1, y1 = viewport_preview_rect(context, area, region)
         else:
