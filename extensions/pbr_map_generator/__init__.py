@@ -16,7 +16,7 @@ Find it in the 3D Viewport sidebar (N key) under the "PBR Maps" tab.
 bl_info = {
     "name": "PBR Map Generator",
     "author": "PBR Map Generator",
-    "version": (1, 9, 0),
+    "version": (1, 10, 0),
     "blender": (3, 6, 0),
     "location": "3D Viewport > Sidebar (N) > PBR Maps",
     "description": "Generate normal, bump, roughness and AO maps from images, plus procedural textures",
@@ -37,6 +37,7 @@ import urllib.request
 
 import bmesh
 import bpy
+from bl_operators.presets import AddPresetBase
 import gpu
 import numpy as np
 from bpy.app.handlers import persistent
@@ -54,6 +55,7 @@ from bpy.props import (
 )
 
 SQRT3 = 3 ** 0.5
+SQRT2 = 2 ** 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +124,10 @@ _MAP_SPEC = (
     ("roughness", "_Roughness", True),
     ("ao", "_AO", True),
     ("metallic", "_Metallic", True),
+    # Channel-packed maps for game engines (only made when chosen in Output Settings)
+    ("orm", "_ORM", True),
+    ("metal_smooth", "_MetallicSmoothness", True),
+    ("mask_map", "_MaskMap", True),
 )
 
 
@@ -137,9 +143,9 @@ def _to_u8(arr):
 def png_bytes(arr, level=2):
     """Encode a (H, W) grey or (H, W, 3) colour array as a PNG (pure numpy + zlib).
     Row 0 of the array is the bottom of the image, as in Blender."""
-    u8 = _to_u8(arr if arr.ndim == 2 or arr.shape[2] == 3 else arr[..., :3])
+    u8 = _to_u8(arr if arr.ndim == 2 or arr.shape[2] in (3, 4) else arr[..., :3])
     h, w = u8.shape[:2]
-    ch = 1 if u8.ndim == 2 else 3
+    ch = 1 if u8.ndim == 2 else u8.shape[2]
     rows = np.ascontiguousarray(u8[::-1]).reshape(h, w * ch)  # PNG stores the top row first
     raw = np.empty((h, w * ch + 1), np.uint8)
     raw[:, 0] = 2  # "Up" filter: store each row as the difference from the row above
@@ -151,7 +157,7 @@ def png_bytes(arr, level=2):
         return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
 
     return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 0 if ch == 1 else 2, 0, 0, 0))
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, {1: 0, 3: 2, 4: 6}[ch], 0, 0, 0))
             + chunk(b"IDAT", comp) + chunk(b"IEND", b""))
 
 
@@ -191,6 +197,8 @@ def images_from_encoded(base, encoded, out_dir="", replace=False):
             img.pack(data=data, data_len=len(data))
             img.source = "FILE"
         img.colorspace_settings.name = "Non-Color" if non_color else "sRGB"
+        if key in ("metal_smooth", "mask_map"):
+            img.alpha_mode = "CHANNEL_PACKED"  # alpha is data (smoothness), not transparency
         result[key] = img
     return result
 
@@ -1032,6 +1040,335 @@ def pat_leather(p, size, rng):
     return {"height": np.clip(height, 0, 1), "albedo": albedo, "rough": rough}
 
 
+def _shear(a, k):
+    """Shift each row sideways by k pixels more than the row below. With a whole
+    number k the result still tiles (the total shift is a multiple of the width)."""
+    h, w = a.shape
+    idx = (np.arange(w)[None, :] - np.arange(h)[:, None] * k) % w
+    return a[np.arange(h)[:, None], idx]
+
+
+def pat_flagstones(p, size, rng):
+    """Large flat slabs of split stone (slate, sandstone) with straight cut edges."""
+    edge, cid = voronoi(size, p.tex_count_x, rng, jitter=1.0)
+    unit = size / p.tex_count_x
+    out = shade_cells(p, size, edge * unit, cid, cid * 7 + 3, unit, rng)
+    # Split-stone layering: soft bands running in a different direction on each slab.
+    # Each slab gets one of eight directions with whole-number steps across the
+    # texture, so the bands still line up where the texture repeats.
+    dirs = np.array([(1, 0), (0, 1), (1, 1), (1, -1), (2, 1), (1, 2), (2, -1), (1, -2)], np.float32)
+    pick = np.minimum((out["r3"] * len(dirs)).astype(np.int64), len(dirs) - 1)
+    yy, xx = pixel_grid(size)
+    freq = max(1, p.tex_count_x * 4)
+    bands = np.sin(2 * np.pi * freq * (xx * dirs[pick, 0] + yy * dirs[pick, 1]) / size
+                   + fbm(size, size, max(2, p.tex_count_x * 2), 3, rng) * 6.0)
+    layer = (0.5 + 0.5 * bands) * p.tex_detail
+    m = out["mask"]
+    out["height"] = out["height"] + (layer - 0.5) * 0.04 * m
+    out["albedo"] = out["albedo"] * (1.0 + (layer[..., None] - 0.5) * 0.18)
+    out["rough"] = out["rough"] - layer * 0.08 * m
+    return out
+
+
+def pat_carpet(p, size, rng):
+    """Soft carpet pile: tufts of fibre with a fuzzy surface."""
+    _edge, cid, f1 = voronoi(size, p.tex_count_x, rng, jitter=0.9, return_f1=True)
+    dome = np.clip(1.0 - f1 / 0.75, 0, 1) ** 0.7
+    fuzz = normalize01(gauss_blur(rng.random((size, size)).astype(np.float32), 1))
+    patch = fbm(size, size, 3, 3, rng)
+    tuft = hash01(cid, cid * 3 + 1, p.tex_seed, 1)
+    height = 0.35 + dome * 0.35 * p.tex_bump + (fuzz - 0.5) * 0.25 * p.tex_detail
+    c1, c2 = _color(p.tex_color1), _color(p.tex_color2)
+    t = np.clip(tuft * p.tex_variation * 2 + (patch - 0.5) * p.tex_variation * 2 + 0.25, 0, 1)
+    albedo = _mix(c1, c2, t[..., None]) * (0.7 + 0.3 * dome[..., None]) * (0.9 + 0.2 * fuzz[..., None])
+    rough = np.clip(np.full((size, size), p.tex_rough, np.float32) - dome * 0.05, 0, 1)
+    return {"height": np.clip(height, 0, 1), "albedo": albedo, "rough": rough}
+
+
+def pat_grass(p, size, rng):
+    """Ground covered in short grass blades, with bare soil showing through."""
+    k = max(1, size // 512)
+    # Short streaks leaning different ways make criss-crossing blades
+    # (each about 1/40 of the texture long and a few pixels wide).
+    ny, nx = max(4, size // 24), max(8, size // 5)
+    blades = value_noise(size, size, ny, nx, rng)
+    for lean in (k, -k, 2 * k, -2 * k):
+        blades = np.maximum(blades, _shear(value_noise(size, size, ny, nx, rng), lean))
+    lo = 0.8 - 0.3 * p.tex_detail
+    b = smoothstep(lo, lo + 0.15, blades)
+    b = b * (0.6 + 0.4 * value_noise(size, size, ny, nx // 2, rng))  # some blades darker
+    clumps = fbm(size, size, max(1, p.tex_count_x), 4, rng)
+    cover = smoothstep(p.tex_gap * 0.8, p.tex_gap * 0.8 + 0.25, clumps)
+    grass = cover * (0.35 + 0.65 * b)
+    soil_n = fbm(size, size, max(8, size // 32), 4, rng)
+    dry = fbm(size, size, max(2, p.tex_count_x * 2), 3, rng)
+    height = 0.2 + soil_n * 0.1 + grass * (0.25 + 0.45 * b) * p.tex_bump
+    c1, c2 = _color(p.tex_color1), _color(p.tex_color2)
+    grass_col = _mix(c1, c2, np.clip((dry - 0.5) * 2 * p.tex_variation * 2 + 0.3 * (1 - b), 0, 1)[..., None])
+    grass_col = grass_col * (0.6 + 0.6 * b[..., None])
+    soil_col = _color(p.tex_gap_color) * (0.75 + 0.5 * soil_n[..., None])
+    albedo = _mix(soil_col, grass_col, grass[..., None])
+    rough = p.tex_rough * grass + p.tex_rough_gap * (1 - grass)
+    return {"height": np.clip(height, 0, 1), "albedo": albedo, "rough": rough}
+
+
+def pat_diamond(p, size, rng):
+    """Diamond (tread) plate: steel with raised lozenge-shaped grips."""
+    nx, ny = max(1, p.tex_count_x), max(1, p.tex_count_y)
+    yy, xx = pixel_grid(size)
+    u, v = xx / size * nx, yy / size * ny
+    i, j = np.floor(u).astype(np.int64), np.floor(v).astype(np.int64)
+    lx, ly = (u - i - 0.5) * (size / nx), (v - j - 0.5) * (size / ny)
+    cell = min(size / nx, size / ny)
+    flip = np.where(((i + j) % 2) == 0, 1.0, -1.0).astype(np.float32)
+    a = (lx + flip * ly) / SQRT2
+    b = (lx - flip * ly) / SQRT2
+    length, width = 0.46 * cell, (0.06 + 0.1 * (1 - p.tex_gap)) * cell
+    d = np.sqrt((a / length) ** 2 + (b / width) ** 2)
+    soft = 0.15 + 0.6 * p.tex_bevel
+    grip = np.clip((1.0 - d) / soft, 0, 1)
+    grip = np.sqrt(grip * (2 - grip))
+    brushed = value_noise(size, size, 6, max(8, size // 4), rng)
+    lines = value_noise(size, size, 3, max(8, size // 2), rng)
+    scratch = smoothstep(0.88, 0.98, lines) * p.tex_detail
+    dents = fbm(size, size, max(2, nx // 2), 3, rng)
+    height = 0.35 + grip * 0.35 + (dents - 0.5) * 0.06 * p.tex_bump + (brushed - 0.5) * 0.01 - scratch * 0.01
+    c1, c2 = _color(p.tex_color1), _color(p.tex_color2)
+    base = _mix(c1, c2, np.clip((dents - 0.5) * 2 * p.tex_variation * 2 + 0.5, 0, 1)[..., None])
+    albedo = base * (0.92 + 0.12 * brushed[..., None] + 0.1 * grip[..., None] + 0.1 * scratch[..., None])
+    rough = np.clip(p.tex_rough + (brushed - 0.5) * 0.12 - grip * 0.12 + scratch * 0.15, 0, 1)
+    return {"height": np.clip(height, 0, 1), "albedo": albedo, "rough": rough,
+            "metal": np.ones((size, size), np.float32)}
+
+
+def pat_chainmail(p, size, rng):
+    """Interlocking metal rings (chainmail)."""
+    cols = max(1, p.tex_count_x)
+    rows = max(2, p.tex_count_y + (p.tex_count_y % 2))  # even, so the row offset tiles
+    cw, rh = size / cols, size / rows
+    yy, xx = pixel_grid(size)
+    v = yy / rh
+    j0 = np.floor(v).astype(np.int64)
+    radius = 0.56 * cw
+    wire = cw * (0.05 + 0.12 * p.tex_bevel)
+    best = np.full((size, size), -1.0, np.float32)
+    ring_id = np.zeros((size, size), np.int64)
+    for dj in (-2, -1, 0, 1, 2):
+        j = j0 + dj
+        shift = (j % 2) * 0.5
+        uu = xx / cw - shift
+        i0 = np.floor(uu).astype(np.int64)
+        for di in (-1, 0, 1):
+            i = i0 + di
+            cx = (i + 0.5 + shift) * cw
+            cy = (j + 0.5) * rh
+            dx, dy = xx - cx, yy - cy
+            dist = np.sqrt(dx * dx + dy * dy)
+            t = np.clip(1.0 - ((dist - radius) / wire) ** 2, 0, 1)
+            tube = np.sqrt(t)
+            # Each row's rings lean the opposite way, so they look woven together.
+            lean = np.where((j % 2) == 0, 1.0, -1.0) * (dx / max(radius, 1e-6))
+            z = np.where(t > 0, 0.25 + tube * 0.45 + lean * 0.18, -1.0).astype(np.float32)
+            closer = z > best
+            np.copyto(best, z, where=closer)
+            np.copyto(ring_id, (j % rows) * cols + (i % cols), where=closer)
+    on = best > -0.5
+    height = np.where(on, best, 0.0)
+    scratches = smoothstep(0.86, 0.98, value_noise(size, size, 3, max(8, size // 2), rng)) * p.tex_detail
+    bumps = fbm(size, size, max(4, cols), 3, rng)
+    height = np.clip(height + (bumps - 0.5) * 0.04 * p.tex_bump * on, 0, 1)
+    r1 = hash01(ring_id, ring_id * 3 + 1, p.tex_seed, 1)
+    c1, c2 = _color(p.tex_color1), _color(p.tex_color2)
+    metal_col = _mix(c1, c2, np.clip(r1 * p.tex_variation * 2 + (bumps - 0.5) * p.tex_variation, 0, 1)[..., None])
+    metal_col = metal_col * (0.65 + 0.35 * np.clip(height, 0, 1)[..., None] + 0.1 * scratches[..., None])
+    albedo = np.where(on[..., None], metal_col, _color(p.tex_gap_color))
+    rough = np.where(on, np.clip(p.tex_rough + scratches * 0.15 + (bumps - 0.5) * 0.1, 0, 1), 0.9)
+    return {"height": height, "albedo": albedo, "rough": rough, "metal": on.astype(np.float32)}
+
+
+def pat_wicker(p, size, rng):
+    """Woven wicker / rattan: wide rounded strands going over and under, with gaps."""
+    nx, ny = max(1, p.tex_count_x), max(1, p.tex_count_y)
+    yy, xx = pixel_grid(size)
+    u, v = xx / size * nx, yy / size * ny
+    i, j = np.floor(u).astype(np.int64), np.floor(v).astype(np.int64)
+    fu, fv = u - i, v - j
+    w = max(0.1, 1.0 - p.tex_gap)
+    au, av = np.abs(fu - 0.5) * 2 / w, np.abs(fv - 0.5) * 2 / w
+    in_u, in_v = au < 1, av < 1
+    prof_u = np.sqrt(np.clip(1 - au * au, 0, 1))
+    prof_v = np.sqrt(np.clip(1 - av * av, 0, 1))
+    top = np.where(((i + j) % 2) == 0, 1.0, -1.0)
+    h_warp = prof_u * (0.55 + 0.35 * top * np.cos(np.pi * (fv - 0.5)))
+    h_weft = prof_v * (0.55 - 0.35 * top * np.cos(np.pi * (fu - 0.5)))
+    fib_warp = value_noise(size, size, ny * 2, nx * 14, rng)
+    fib_weft = value_noise(size, size, ny * 14, nx * 2, rng)
+    h_warp = h_warp + (fib_warp - 0.5) * 0.12 * p.tex_detail
+    h_weft = h_weft + (fib_weft - 0.5) * 0.12 * p.tex_detail
+    hw = np.where(in_u, h_warp, -1.0)
+    hf = np.where(in_v, h_weft, -1.0)
+    warp_wins = hw >= hf
+    strand = in_u | in_v
+    height = np.where(strand, np.maximum(hw, hf), 0.05)
+    height = 0.05 + (height - 0.05) * min(1.0, 0.4 + p.tex_bump)
+    var_i = 1.0 + (hash01(i % nx, 0, p.tex_seed, 5) - 0.5) * 2 * p.tex_variation
+    var_j = 1.0 + (hash01(0, j % ny, p.tex_seed, 6) - 0.5) * 2 * p.tex_variation
+    c1, c2 = _color(p.tex_color1), _color(p.tex_color2)
+    col = np.where(warp_wins[..., None], c1 * var_i[..., None], c2 * var_j[..., None])
+    col = col * (0.6 + 0.4 * np.clip(height, 0, 1))[..., None]
+    albedo = np.where(strand[..., None], col, _color(p.tex_gap_color))
+    rough = np.where(strand, p.tex_rough, 0.95).astype(np.float32)
+    return {"height": np.clip(height, 0, 1), "albedo": albedo, "rough": rough}
+
+
+def pat_scales(p, size, rng):
+    """Overlapping scales (fish, reptile or dragon), each one raised at its free edge."""
+    cols = max(1, p.tex_count_x)
+    rows = max(2, p.tex_count_y + (p.tex_count_y % 2))  # even, so the row offset tiles
+    cw, rh = size / cols, size / rows
+    radius = 0.62 * cw
+    yy, xx = pixel_grid(size)
+    j0 = np.floor(yy / rh).astype(np.int64)
+    best_cy = np.full((size, size), np.inf, np.float64)
+    t_best = np.ones((size, size), np.float32)
+    sid = np.zeros((size, size), np.int64)
+    for dj in (-1, 0, 1, 2, 3):
+        j = j0 + dj
+        shift = (j % 2) * 0.5
+        i0 = np.floor(xx / cw - shift).astype(np.int64)
+        for di in (-1, 0, 1):
+            i = i0 + di
+            cx = (i + 0.5 + shift) * cw
+            cy = (j + 0.5) * rh
+            dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+            # The lower scale covers the one above it (their free edges point down).
+            take = (dist < radius) & (cy < best_cy)
+            np.copyto(best_cy, cy, where=take)
+            np.copyto(t_best, (dist / radius).astype(np.float32), where=take)
+            np.copyto(sid, (j % rows) * cols + (i % cols), where=take)
+    covered = np.isfinite(best_cy)
+    t = t_best
+    rim = 0.06 + 0.25 * p.tex_bevel
+    h = 0.25 + 0.5 * t
+    h = h * (1.0 - 0.5 * smoothstep(1.0 - rim, 1.0, t))
+    bumps = fbm(size, size, max(4, cols * 2), 3, rng)
+    height = np.where(covered, h + (bumps - 0.5) * 0.06 * p.tex_bump, 0.05)
+    r1 = hash01(sid, sid * 5 + 2, p.tex_seed, 1)
+    r2 = hash01(sid, sid * 5 + 2, p.tex_seed, 2)
+    c1, c2 = _color(p.tex_color1), _color(p.tex_color2)
+    col = _mix(c1, c2, r1[..., None]) * (1.0 + (r2[..., None] - 0.5) * 2 * p.tex_variation)
+    col = col * (0.55 + 0.45 * t[..., None]) * (0.9 + 0.2 * bumps[..., None])
+    albedo = np.where(covered[..., None], col, _color(p.tex_gap_color))
+    rough = np.where(covered, np.clip(p.tex_rough + (1 - t) * 0.1, 0, 1), 0.9)
+    return {"height": np.clip(height, 0, 1), "albedo": albedo, "rough": rough}
+
+
+# ---------------------------------------------------------------------------
+# Weathering: layers added on top of any pattern
+# ---------------------------------------------------------------------------
+
+def weathering_active(p):
+    return any(getattr(p, "weather_" + k, 0.0) > 0 for k in ("dirt", "moss", "rust", "edges"))
+
+
+def apply_weathering(p, size, data):
+    """Moss, dirt, rust streaks and worn edges, placed using the pattern's own
+    height (crevices collect dirt and moss, raised edges get worn). Uses its own
+    random numbers, so the pattern underneath stays exactly the same."""
+    rng = np.random.default_rng(p.tex_seed + 7919)
+    h = np.clip(data["height"], 0, 1).astype(np.float32)
+    albedo = np.clip(data["albedo"], 0, 1)
+    rough = np.clip(data["rough"], 0, 1)
+    metal = data.get("metal")
+    around = gauss_blur(h, max(2, size // 96))
+    crevice = np.clip((around - h) / 0.05, 0, 1)   # 1 deep in gaps and cracks
+    exposed = np.clip((h - around) / 0.04, 0, 1)   # 1 on raised edges and peaks
+    patches = fbm(size, size, 4, 5, rng)
+    fine = fbm(size, size, max(8, size // 32), 4, rng)
+
+    def coverage(score, amount):
+        t = 1.15 - amount
+        return smoothstep(t, t + 0.3, score) * min(1.0, amount * 4)
+
+    def lay(mask, color, rough_to, height_add, metal_to=0.0):
+        nonlocal albedo, rough, h, metal
+        m = mask[..., None]
+        albedo = albedo * (1 - m) + color * m
+        rough = rough * (1 - mask) + rough_to * mask
+        h = np.clip(h + height_add, 0, 1)
+        if metal is not None:
+            metal = metal * (1 - mask) + metal_to * mask
+
+    if p.weather_edges > 0:
+        # Broken up into chips, and a paler, duller version of the surface
+        # (scuffed and dusty), rather than a bright outline.
+        chips = smoothstep(0.4, 0.6, fbm(size, size, max(16, size // 24), 3, rng))
+        m = coverage(exposed * 0.9 + (fine - 0.5) * 0.4 + 0.15, p.weather_edges) * chips
+        lum = (albedo @ np.array([0.2126, 0.7152, 0.0722], np.float32))[..., None]
+        worn = np.clip(albedo * 0.55 + lum * 0.45 + 0.07, 0, 1)
+        lay(m, worn, np.clip(rough - 0.15, 0, 1), -m * 0.015, 1.0 if metal is not None else 0.0)
+    if p.weather_rust > 0:
+        streak = value_noise(size, size, 3, max(8, size // 12), rng)
+        score = streak * 0.6 + crevice * 0.35 + patches * 0.35
+        m = coverage(score, p.weather_rust)
+        rust_col = _mix(_color((0.42, 0.17, 0.06)), _color((0.22, 0.09, 0.04)), fine[..., None])
+        lay(m, rust_col, 0.85, -m * fine * 0.02)
+    if p.weather_dirt > 0:
+        m = coverage(crevice * 0.7 + patches * 0.55, p.weather_dirt) * 0.85
+        dirt_col = _color((0.16, 0.12, 0.09)) * (0.8 + 0.4 * fine[..., None])
+        lay(m, dirt_col, 0.95, m * 0.01)
+    if p.weather_moss > 0:
+        m = coverage(crevice * 0.6 + patches * 0.6 + (fine - 0.5) * 0.3, p.weather_moss)
+        moss_col = _color(p.weather_moss_color) * (0.65 + 0.7 * fine[..., None])
+        lay(m, moss_col, 0.95, m * (0.03 + 0.03 * fine))
+
+    out = dict(data)
+    out.update(height=h, albedo=albedo, rough=rough)
+    if metal is not None:
+        out["metal"] = metal
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Image helpers: seamless tiling and game-engine packed maps
+# ---------------------------------------------------------------------------
+
+def make_seamless(rgb, width=0.25):
+    """Blend a photo with a half-shifted copy of itself so its edges meet up and it
+    repeats without visible seams. Done one direction at a time, so the shifted
+    copy's own seam always sits where the original is fully kept."""
+    out = rgb.astype(np.float32)
+    for axis in (1, 0):
+        n = out.shape[axis]
+        shifted = np.roll(out, n // 2, axis=axis)
+        t = (np.arange(n, dtype=np.float32) + 0.5) / n
+        wgt = smoothstep(0.0, max(width * 0.5, 1e-3), np.minimum(t, 1 - t))
+        shape = [1, 1, 1]
+        shape[axis] = n
+        wgt = wgt.reshape(shape)
+        out = out * wgt + shifted * (1 - wgt)
+    return out
+
+
+def add_engine_maps(arrays, pack):
+    """Extra channel-packed maps that game engines expect (added beside the normal ones)."""
+    if pack == "NONE":
+        return arrays
+    ao = arrays["ao"]
+    rough = arrays["roughness"]
+    metal = arrays.get("metallic")
+    if metal is None:
+        metal = np.zeros_like(rough)
+    out = dict(arrays)
+    if pack == "ORM":        # Unreal Engine, Godot, glTF: R = AO, G = Roughness, B = Metallic
+        out["orm"] = np.dstack([ao, rough, metal]).astype(np.float32)
+    elif pack == "UNITY":    # Unity URP / Built-in: Metallic in RGB, Smoothness in alpha
+        out["metal_smooth"] = np.dstack([metal, metal, metal, 1 - rough]).astype(np.float32)
+    elif pack == "HDRP":     # Unity HDRP Mask Map: Metallic, AO, Detail Mask, Smoothness
+        out["mask_map"] = np.dstack([metal, ao, np.zeros_like(ao), 1 - rough]).astype(np.float32)
+    return out
+
+
 PATTERNS = {
     "BRICKS": ("Bricks", pat_bricks),
     "STONES": ("Cobblestones", pat_stones),
@@ -1054,14 +1391,29 @@ PATTERNS = {
     "RUSTY": ("Rusty Metal", pat_rusty),
     "FABRIC": ("Fabric", pat_fabric),
     "LEATHER": ("Leather", pat_leather),
+    "FLAGSTONES": ("Flagstones", pat_flagstones),
+    "CARPET": ("Carpet", pat_carpet),
+    "GRASS": ("Grass Ground", pat_grass),
+    "DIAMOND": ("Diamond Plate", pat_diamond),
+    "CHAINMAIL": ("Chainmail", pat_chainmail),
+    "WICKER": ("Wicker", pat_wicker),
+    "SCALES": ("Scales", pat_scales),
 }
+
+# Each pattern's number is what .blend files store, so existing ones never change.
+PATTERN_IDS = {k: i for i, k in enumerate(
+    ["BRICKS", "STONES", "GRAVEL", "ROOF", "TILES", "HEX", "TERRAZZO", "PLANKS", "HERRINGBONE",
+     "CONCRETE", "PLASTER", "ASPHALT", "ROCK", "MUD", "SAND", "BARK", "METAL", "CORRUGATED",
+     "RUSTY", "FABRIC", "LEATHER",
+     "FLAGSTONES", "CARPET", "GRASS", "DIAMOND", "CHAINMAIL", "WICKER", "SCALES"])}
 
 # Dropdown layout: (heading, [pattern keys]) with a tooltip per pattern.
 PATTERN_GROUPS = (
-    ("Masonry & Roofs", ["BRICKS", "STONES", "GRAVEL", "ROOF"]),
-    ("Floors & Tiles", ["TILES", "HEX", "TERRAZZO", "PLANKS", "HERRINGBONE"]),
-    ("Walls & Ground", ["CONCRETE", "PLASTER", "ASPHALT", "ROCK", "MUD", "SAND", "BARK"]),
-    ("Metal & Fabric", ["METAL", "CORRUGATED", "RUSTY", "FABRIC", "LEATHER"]),
+    ("Masonry & Roofs", ["BRICKS", "STONES", "FLAGSTONES", "GRAVEL", "ROOF"]),
+    ("Floors & Tiles", ["TILES", "HEX", "TERRAZZO", "PLANKS", "HERRINGBONE", "CARPET"]),
+    ("Walls & Ground", ["CONCRETE", "PLASTER", "ASPHALT", "ROCK", "MUD", "SAND", "GRASS", "BARK"]),
+    ("Metal", ["METAL", "DIAMOND", "CORRUGATED", "RUSTY", "CHAINMAIL"]),
+    ("Fabric & Natural", ["FABRIC", "WICKER", "LEATHER", "SCALES"]),
 )
 PATTERN_TIPS = {
     "BRICKS": "Brick wall with mortar",
@@ -1085,16 +1437,22 @@ PATTERN_TIPS = {
     "RUSTY": "Painted metal with chipped paint and rust",
     "FABRIC": "Woven cloth",
     "LEATHER": "Pebbled leather grain with creases",
+    "FLAGSTONES": "Large flat slabs of split stone such as slate or sandstone",
+    "CARPET": "Soft carpet pile made of fibre tufts",
+    "GRASS": "Ground covered in short grass, with soil showing through",
+    "DIAMOND": "Diamond (tread) plate: steel with raised grips",
+    "CHAINMAIL": "Interlocking metal rings",
+    "WICKER": "Woven wicker or rattan, like a basket",
+    "SCALES": "Overlapping fish, reptile or dragon scales",
 }
 
 
 def _pattern_enum_items():
-    items, i = [], 0
+    items = []
     for heading, keys in PATTERN_GROUPS:
         items.append(("", heading, ""))
         for k in keys:
-            items.append((k, PATTERNS[k][0], PATTERN_TIPS[k], i))
-            i += 1
+            items.append((k, PATTERNS[k][0], PATTERN_TIPS[k], PATTERN_IDS[k]))
     return items
 
 
@@ -1135,6 +1493,25 @@ PATTERN_UI = {
                  {"count_x": "Chip Size (inverse)", "gap": "Chip Spacing", "detail": "Chip Amount", "color1": "Base Color", "color2": "Chip Color 1", "gap_color": "Chip Color 2"}),
     "LEATHER": (["count_x", "bump", "detail", "color1", "color2", "variation", "rough"],
                 {"count_x": "Grain Size (inverse)", "bump": "Pebble Depth", "detail": "Creases"}),
+    "FLAGSTONES": ([k for k in _PIECES if k != "count_y"] + ["detail"],
+                   {"count_x": "Slabs Across", "gap": "Gap Size", "bevel": "Edge Rounding", "wear": "Chipped Edges", "detail": "Stone Layers"}),
+    "CARPET": (["count_x", "bump", "detail", "color1", "color2", "variation", "rough"],
+               {"count_x": "Tufts Across", "bump": "Tuft Height", "detail": "Fuzz"}),
+    "GRASS": (["count_x", "gap", "bump", "detail", "color1", "color2", "gap_color", "variation", "rough", "rough_gap"],
+              {"count_x": "Clump Scale", "gap": "Bare Soil", "bump": "Blade Height", "detail": "Blade Density",
+               "color1": "Grass Color", "color2": "Dry Grass Color", "gap_color": "Soil Color",
+               "rough": "Grass Roughness", "rough_gap": "Soil Roughness"}),
+    "DIAMOND": (["count_x", "count_y", "gap", "bevel", "bump", "detail", "color1", "color2", "variation", "rough"],
+                {"count_x": "Grips Across", "count_y": "Grips Down", "gap": "Grip Thinness", "bevel": "Grip Roundness",
+                 "bump": "Dents", "detail": "Scratches", "color1": "Steel Color", "color2": "Worn Color"}),
+    "CHAINMAIL": (["count_x", "count_y", "bevel", "bump", "detail", "color1", "color2", "gap_color", "variation", "rough"],
+                  {"count_x": "Rings Across", "count_y": "Ring Rows", "bevel": "Wire Thickness", "detail": "Scratches",
+                   "color1": "Metal Color", "color2": "Tarnish Color", "gap_color": "Backing Color"}),
+    "WICKER": (["count_x", "count_y", "gap", "bump", "detail", "color1", "color2", "gap_color", "variation", "rough"],
+               {"count_x": "Strands Across", "count_y": "Strands Down", "gap": "Gap Between Strands", "bump": "Strand Roundness",
+                "detail": "Fibers", "color1": "Strand Color", "color2": "Cross Strand Color", "gap_color": "Gap Color"}),
+    "SCALES": (["count_x", "count_y", "bevel", "bump", "color1", "color2", "gap_color", "variation", "rough"],
+               {"count_x": "Scales Across", "count_y": "Scale Rows", "bevel": "Rim Softness", "gap_color": "Gap Color"}),
 }
 
 # Good starting values loaded whenever the pattern is changed.
@@ -1190,6 +1567,25 @@ PRESETS = {
                      rough=0.2),
     "LEATHER": dict(count_x=90, bump=0.5, detail=0.4, variation=0.15,
                     color1=(0.36, 0.20, 0.11), color2=(0.28, 0.15, 0.08), rough=0.55),
+    "FLAGSTONES": dict(count_x=4, gap=0.05, bevel=0.08, wear=0.8, bump=0.3, detail=0.5, variation=0.35,
+                       color1=(0.42, 0.40, 0.38), color2=(0.31, 0.29, 0.28), gap_color=(0.25, 0.22, 0.18),
+                       rough=0.75, rough_gap=0.95),
+    "CARPET": dict(count_x=120, bump=0.5, detail=0.6, variation=0.12,
+                   color1=(0.45, 0.12, 0.12), color2=(0.36, 0.09, 0.10), rough=0.95),
+    "GRASS": dict(count_x=4, gap=0.3, bump=0.6, detail=0.6, variation=0.3,
+                  color1=(0.20, 0.36, 0.08), color2=(0.45, 0.42, 0.18), gap_color=(0.22, 0.16, 0.10),
+                  rough=0.6, rough_gap=0.95),
+    "DIAMOND": dict(count_x=10, count_y=10, gap=0.3, bevel=0.3, bump=0.3, detail=0.5, variation=0.1,
+                    color1=(0.62, 0.63, 0.65), color2=(0.52, 0.53, 0.55), rough=0.35),
+    "CHAINMAIL": dict(count_x=12, count_y=24, bevel=0.4, bump=0.3, detail=0.5, variation=0.2,
+                      color1=(0.60, 0.60, 0.62), color2=(0.42, 0.38, 0.32), gap_color=(0.02, 0.02, 0.02),
+                      rough=0.35),
+    "WICKER": dict(count_x=12, count_y=12, gap=0.25, bump=0.6, detail=0.6, variation=0.15,
+                   color1=(0.70, 0.52, 0.30), color2=(0.62, 0.45, 0.25), gap_color=(0.08, 0.05, 0.03),
+                   rough=0.7),
+    "SCALES": dict(count_x=10, count_y=20, bevel=0.3, bump=0.3, variation=0.25,
+                   color1=(0.18, 0.34, 0.20), color2=(0.10, 0.22, 0.16), gap_color=(0.03, 0.05, 0.03),
+                   rough=0.35),
 }
 
 
@@ -1318,21 +1714,53 @@ def assign_to_active(context, mat):
     return True
 
 
-def finish(op, context, base, maps, props, replace=False):
+def mark_asset(mat, tag):
+    """Show the material in the Asset Browser, with a rendered thumbnail."""
+    try:
+        mat.asset_mark()
+        mat.asset_data.description = "Made with PBR Map Generator"
+        for t in ("PBR Map Generator", tag):
+            if t and t not in mat.asset_data.tags:
+                mat.asset_data.tags.new(t)
+        mat.asset_generate_preview()
+    except Exception as e:  # noqa: BLE001 - thumbnails can fail without a window
+        print("PBR Map Generator: could not finish marking asset:", e)
+
+
+def add_displacement_subdivision(obj, levels):
+    """Give the object enough faces for displacement to move (Simple keeps its shape)."""
+    if obj.type != "MESH":
+        return False
+    mod = obj.modifiers.get("PBR Displacement")
+    if mod is None:
+        mod = obj.modifiers.new("PBR Displacement", "SUBSURF")
+    mod.subdivision_type = "SIMPLE"
+    mod.levels = mod.render_levels = levels
+    return True
+
+
+def finish(op, context, base, maps, props, replace=False, assign=True, quiet=False):
     old = bpy.data.materials.get(base) if replace else None
     mat = build_material(base, maps, props)
     if replace:
         replace_datablock(old, mat, base)
     msg = ("Replaced material '%s'" if old is not None else "Created material '%s'") % mat.name
-    if props.assign_to_active:
+    if props.mark_as_asset:
+        mark_asset(mat, base[:-4] if base.endswith("_PBR") else base)
+        msg += ", added to the Asset Browser"
+    if props.assign_to_active and assign:
         if assign_to_active(context, mat):
             obj = context.active_object
             msg += " on '%s'" % obj.name
+            if props.use_displacement and props.displacement_subdivide:
+                add_displacement_subdivision(obj, props.displacement_levels)
             if props.projection == "UV" and obj.type == "MESH" and not obj.data.uv_layers:
                 op.report({"WARNING"}, "Object has no UV map; unwrap it (U) to see the texture")
         else:
             msg += " (no suitable active object to assign it to)"
-    op.report({"INFO"}, msg)
+    if not quiet:
+        op.report({"INFO"}, msg)
+    return mat
 
 
 # ---------------------------------------------------------------------------
@@ -1380,19 +1808,85 @@ def download_image(url, out_dir=""):
 # ---------------------------------------------------------------------------
 
 preview_collections = {}
-_preview_state = {"counter": 0, "last_path": ""}
+_preview_state = {"counter": 0, "last_path": "", "gen": 0, "error": "", "interactive": False, "pixels": None}
+
+
+class _QuietReport:
+    """Stands in for an operator so helpers can 'report' problems without one."""
+    def __init__(self):
+        self.message = ""
+
+    def report(self, _kind, message):
+        self.message = message
+
+
+def _set_preview_error(message):
+    if _preview_state.get("error", "") != message:
+        _preview_state["error"] = message
+        _redraw_sidebars()
+
+
+def _redraw_sidebars():
+    try:
+        for win in bpy.context.window_manager.windows:
+            for area in win.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _run_preview_timer():
+    """Live preview: the texture maps are made on a worker thread so Blender stays
+    responsive while you drag a slider; only the final render runs here."""
     try:
-        wm = bpy.context.window_manager
-        if wm.windows:
-            with bpy.context.temp_override(window=wm.windows[0]):
-                bpy.ops.pbrgen.preview()
+        p = bpy.context.scene.pbrgen
+        settings = snapshot_settings(p)
+        if p.preview_source == "TEXTURE":
+            def job():
+                return procedural_arrays(settings, 512)
         else:
-            bpy.ops.pbrgen.preview()
+            quiet = _QuietReport()
+            src = get_source_image(quiet, p)  # may read or download: main thread
+            if src is None:
+                _set_preview_error(quiet.message)
+                return None
+            rgb = read_rgb(src, min(p.max_size, 1024))
+
+            def job():
+                return image_arrays(rgb, settings)
     except Exception as e:  # noqa: BLE001
-        print("PBR Map Generator: preview failed:", e)
+        _set_preview_error(str(e))
+        return None
+
+    gen = _preview_state["gen"] = _preview_state.get("gen", 0) + 1
+    state = {"done": False, "arrays": None, "error": None}
+
+    def run():
+        try:
+            state["arrays"] = job()
+        except Exception as e:  # noqa: BLE001
+            state["error"] = e
+        finally:
+            state["done"] = True
+
+    def poll():
+        if not state["done"]:
+            return 0.03
+        if gen != _preview_state["gen"] or _preview_state.get("interactive"):
+            return None  # a newer change (or a drag) took over
+        if state["error"] is not None:
+            _set_preview_error(str(state["error"]))
+            return None
+        try:
+            show_preview(render_preview(state["arrays"], bpy.context.scene.pbrgen))
+            _set_preview_error("")
+        except Exception as e:  # noqa: BLE001
+            _set_preview_error(str(e))
+        return None
+
+    threading.Thread(target=run, daemon=True, name="pbrgen-preview").start()
+    bpy.app.timers.register(poll, first_interval=0.03)
     return None
 
 
@@ -1403,11 +1897,12 @@ def _queue_preview(context, force=False):
     scene = context.scene if context else bpy.context.scene
     if not force and not scene.pbrgen.preview_live:
         return
-    if _preview_state.get("dragging"):
-        return  # the drag renders its own frames
+    if _preview_state.get("interactive"):
+        return  # a drag or zoom renders its own frames
+    drop_live_rig()  # the kept preview scene is out of date now
     if bpy.app.timers.is_registered(_run_preview_timer):
         bpy.app.timers.unregister(_run_preview_timer)
-    bpy.app.timers.register(_run_preview_timer, first_interval=0.4)
+    bpy.app.timers.register(_run_preview_timer, first_interval=0.25)
 
 
 def schedule_preview(self, context):
@@ -1459,6 +1954,7 @@ def _subscribe_selection():
 @persistent
 def _on_file_loaded(_dummy=None):
     _subscribe_selection()  # message-bus subscriptions are cleared when a file loads
+    _live["rig"] = None     # the kept preview scene belonged to the old file
 
 
 def _redraw_viewports(self=None, context=None):
@@ -1471,7 +1967,7 @@ def _redraw_viewports(self=None, context=None):
 
 PREVIEW_IMAGE_NAME = ".PBRGen Preview"  # leading dot hides it from image lists
 _draw_state = {"handle": None, "ui_handle": None, "visible": {}, "debug": {},
-               "sidebar_image": {}, "sidebar_drawing": {}}
+               "sidebar_image": {}, "sidebar_drawing": {}, "sidebar_found": {}, "locate_key": {}}
 
 def sidebar_icon_scale(region_width, ui):
     """Icon scale that makes the sidebar preview fill the sidebar's width."""
@@ -1577,13 +2073,63 @@ def sidebar_preview_rect(region):
     return 14 * ui, top - size, region.width - 26 * ui, top
 
 
+def _locate_sidebar_image(region):
+    """Find exactly where the preview image is in the sidebar, by matching a column
+    of the drawn pixels against the preview picture. This keeps drag/zoom working
+    wherever the Preview panel is (moved below another panel, scrolled...).
+    Returns (x0, y0, x1, y1) in region pixels, or None if it can't be found."""
+    px = _preview_state.get("pixels")
+    if px is None:
+        return None
+    ex0, ey0, ex1, ey1 = sidebar_preview_rect(region)  # the estimate gives the size
+    est = int(round(ey1 - ey0))
+    vx, vy, vw, vh = gpu.state.viewport_get()
+    cx = int((ex0 + ex1) / 2)
+    if est < 24 or not (0 <= cx < vw) or vh < est:
+        return None
+    buf = gpu.state.active_framebuffer_get().read_color(vx + cx, vy, 1, vh, 4, 0, "FLOAT")
+    col = np.array(buf.to_list(), np.float32).reshape(-1, 4)[:vh, :3]
+    f = col @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+    h, w = px.shape[:2]
+    tcol = px[:, w // 2, :3] @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+    best = (0.0, None)
+    for s in range(max(24, est - 12), min(vh, est + 13), 2):
+        t = np.interp(np.linspace(0, h - 1, s), np.arange(h), tcol).astype(np.float32)
+        t = t - t.mean()
+        tn = float(np.sqrt((t * t).sum()))
+        if tn < 1e-4:
+            return None  # a flat picture can't be matched
+        win = np.lib.stride_tricks.sliding_window_view(f, s)
+        wm = win - win.mean(axis=1, keepdims=True)
+        wn = np.sqrt((wm * wm).sum(axis=1)) + 1e-6
+        corr = (wm @ t) / (wn * tn)
+        i = int(np.argmax(corr))
+        if corr[i] > best[0]:
+            best = (float(corr[i]), (ex0, float(i), ex1, float(i + s)))
+    return best[1] if best[0] > 0.9 else None
+
+
 def _note_sidebar_drawn():
     """Runs after each sidebar redraw: remembers whether the Preview panel's image
     was drawn this time (it isn't when the panel is collapsed or another tab is open)."""
     region = bpy.context.region
     if region is not None:
         key = region.as_pointer()
-        _draw_state["sidebar_image"][key] = _draw_state["sidebar_drawing"].pop(key, False)
+        drawn = _draw_state["sidebar_drawing"].pop(key, False)
+        _draw_state["sidebar_image"][key] = drawn
+        if drawn:
+            # Only search again when something that moves the image has changed.
+            try:
+                top = region.view2d.region_to_view(0, region.height)[1]
+            except Exception:  # noqa: BLE001
+                top = 0.0
+            lk = (round(top), region.width, region.height, _preview_state["counter"])
+            if _draw_state["locate_key"].get(key) != lk:
+                _draw_state["locate_key"][key] = lk
+                try:
+                    _draw_state["sidebar_found"][key] = _locate_sidebar_image(region)
+                except Exception:  # noqa: BLE001 - fall back to the estimate
+                    _draw_state["sidebar_found"][key] = None
     sync_viewport_overlay(bpy.context)  # also runs on other tabs, where our panels don't draw
 
 
@@ -1697,6 +2243,31 @@ class PBRGEN_Props(bpy.types.PropertyGroup):
         description="How far the preview shape is tipped towards you (positive) or away from you "
                     "(negative). Drag the preview image up or down to change it. Only the preview "
                     "moves: your scene is not changed")
+    preview_zoom: FloatProperty(
+        name="Zoom", default=1.0, min=0.4, max=4.0, update=_on_shape_change,
+        description="How close the preview camera is. Scroll the mouse wheel over the preview image "
+                    "to change it")
+    preview_lighting: EnumProperty(
+        name="Lighting",
+        description="The light the preview is shown in, so you can check how the material looks "
+                    "in different places. Only the preview uses it",
+        items=[
+            ("STUDIO", "Studio", "Soft studio lights placed to show bumps and shine clearly", "LIGHT_AREA", 0),
+            ("SUN", "Outdoor Sun", "Bright direct sunlight under a blue sky", "LIGHT_SUN", 1),
+            ("FOREST", "Forest", "Blender's built-in forest HDRI: soft green-tinted daylight", "WORLD", 2),
+            ("CITY", "City", "Blender's built-in city HDRI: overcast street light", "WORLD", 3),
+            ("COURTYARD", "Courtyard", "Blender's built-in courtyard HDRI: bright sunny daylight", "WORLD", 4),
+            ("INTERIOR", "Interior", "Blender's built-in interior HDRI: warm indoor light", "WORLD", 5),
+            ("NIGHT", "Night", "Blender's built-in night HDRI: dark with street lamps", "WORLD", 6),
+            ("SUNRISE", "Sunrise", "Blender's built-in sunrise HDRI: low, warm sun", "WORLD", 7),
+            ("SUNSET", "Sunset", "Blender's built-in sunset HDRI: orange evening light", "WORLD", 8),
+            ("CUSTOM", "Your HDRI", "Light the preview with an HDRI file of your own (.hdr or .exr)", "FILE_IMAGE", 9),
+        ],
+        default="STUDIO",
+        update=_on_shape_change)
+    preview_hdri: StringProperty(
+        name="HDRI File", subtype="FILE_PATH", default="", update=_on_shape_change,
+        description="An HDRI image (.hdr or .exr) to light the preview with. Free ones are on polyhaven.com/hdris")
     on_existing: EnumProperty(
         name="If It Already Exists",
         description="What to do when you generate a texture whose material already exists "
@@ -1767,9 +2338,36 @@ class PBRGEN_Props(bpy.types.PropertyGroup):
     displacement_scale: FloatProperty(
         name="Displacement Scale", default=0.05, min=0.0, soft_max=1.0, update=schedule_preview,
         description="How far the displacement pushes the surface out, in meters")
+    displacement_subdivide: BoolProperty(
+        name="Add Subdivision", default=True,
+        description="When the material is put on an object, also add a Subdivision modifier (Simple, so the "
+                    "shape doesn't round off) so there is enough geometry for the displacement to move")
+    displacement_levels: IntProperty(
+        name="Levels", default=4, min=1, max=7,
+        description="How many times the Subdivision modifier splits each face. Each level gives 4x the faces: "
+                    "more detail, but slower")
     assign_to_active: BoolProperty(
         name="Assign to Active Object", default=True,
         description="Put the new material on the selected object after generating")
+    mark_as_asset: BoolProperty(
+        name="Save to Asset Browser", default=False,
+        description="Mark each generated material as an asset with a preview thumbnail, so it shows in the "
+                    "Asset Browser. Save this .blend file inside an asset library folder (Preferences > File "
+                    "Paths > Asset Libraries) to drag the materials into any project")
+    pack_maps: EnumProperty(
+        name="Game Engine Maps",
+        description="Also make the channel-packed map a game engine expects, saved beside the normal maps",
+        items=[
+            ("NONE", "None", "Only the standard maps"),
+            ("ORM", "ORM (Unreal, Godot, glTF)",
+             "One image with AO in red, Roughness in green and Metallic in blue. "
+             "For Unreal, also turn on DirectX Normals"),
+            ("UNITY", "Unity (URP / Built-in)",
+             "Metallic map with Smoothness (the opposite of roughness) in its alpha channel"),
+            ("HDRP", "Unity HDRP Mask Map",
+             "Metallic in red, AO in green, Detail Mask in blue and Smoothness in alpha"),
+        ],
+        default="NONE")
 
     # --- image source
     source_mode: EnumProperty(
@@ -1779,8 +2377,22 @@ class PBRGEN_Props(bpy.types.PropertyGroup):
             ("FILE", "File", "Load an image file from your computer"),
             ("URL", "URL", "Download an image from the internet"),
             ("EXISTING", "Loaded", "Use an image that is already loaded in Blender"),
+            ("FOLDER", "Folder", "Turn every image in a folder into its own material in one go"),
         ],
-        default="FILE")
+        default="FILE",
+        update=schedule_preview)
+    folder_path: StringProperty(
+        name="Image Folder", subtype="DIR_PATH", default="", update=schedule_preview,
+        description="Folder of images to convert. Each image becomes its own set of maps and material. "
+                    "The preview shows the first image")
+    make_seamless: BoolProperty(
+        name="Make Seamless", default=False, update=schedule_preview,
+        description="Blend the image's edges so it repeats without visible seams. Most photos from the "
+                    "internet don't tile, so turn this on if you see lines where the texture repeats")
+    seamless_width: FloatProperty(
+        name="Blend Width", default=0.3, min=0.05, max=1.0, subtype="FACTOR", update=schedule_preview,
+        description="How much of the image near its edges is blended. Wider hides seams better but can "
+                    "show soft doubled areas")
     filepath: StringProperty(
         name="Image File", subtype="FILE_PATH", default="", update=schedule_preview,
         description="The photo or texture image to turn into PBR maps")
@@ -1885,6 +2497,22 @@ class PBRGEN_Props(bpy.types.PropertyGroup):
         name="Seed", default=1, min=0, update=schedule_preview,
         description="Change this to get a different random version of the same texture")
 
+    # --- weathering (layers on top of any pattern)
+    weather_dirt: FloatProperty(
+        name="Dirt", default=0.0, min=0.0, max=1.0, subtype="FACTOR", update=schedule_preview,
+        description="Dark grime that collects in gaps, cracks and patches")
+    weather_moss: FloatProperty(
+        name="Moss", default=0.0, min=0.0, max=1.0, subtype="FACTOR", update=schedule_preview,
+        description="Moss growing out of the gaps and spreading across the surface")
+    weather_moss_color: _col("Moss Color", (0.20, 0.30, 0.07), "Color of the moss")
+    weather_rust: FloatProperty(
+        name="Rust Streaks", default=0.0, min=0.0, max=1.0, subtype="FACTOR", update=schedule_preview,
+        description="Orange-brown rust stains running down the surface")
+    weather_edges: FloatProperty(
+        name="Worn Edges", default=0.0, min=0.0, max=1.0, subtype="FACTOR", update=schedule_preview,
+        description="Raised edges rubbed lighter and smoother, as if worn by years of use. "
+                    "On metal patterns the bare metal shows through")
+
 
 # ---------------------------------------------------------------------------
 # Map generation (arrays only, no Blender data)
@@ -1908,6 +2536,8 @@ def read_rgb(img, max_size):
 
 
 def image_arrays(rgb, p):
+    if getattr(p, "make_seamless", False):
+        rgb = make_seamless(rgb, p.seamless_width)
     h, w = rgb.shape[:2]
     big = max(4, int(max(h, w) / 16))
     lum = luminance(rgb)
@@ -1943,6 +2573,8 @@ def image_arrays(rgb, p):
 def procedural_arrays(p, size):
     func = PATTERNS[p.tex_pattern][1]
     data = func(p, size, np.random.default_rng(p.tex_seed))
+    if weathering_active(p):
+        data = apply_weathering(p, size, data)
     height = np.clip(data["height"], 0, 1)
     normal = height_to_normal(height, p.normal_strength * size / 1024.0 * 2.0, p.directx_normal)
     ao = height_to_ao(height, max(2, int(p.ao_radius * size / 1024.0)), p.ao_strength * 0.5)
@@ -1973,9 +2605,27 @@ def get_source_image(op, p):
         p.source_image = img
         p.source_mode = "EXISTING"  # don't download again on every preview
         return img
+    if p.source_mode == "FOLDER":
+        files = folder_images(p.folder_path)
+        if not files:
+            op.report({"ERROR"}, "Choose a folder that has images in it first")
+            return None
+        return bpy.data.images.load(files[0], check_existing=True)
     if p.source_image is None:
         op.report({"ERROR"}, "Pick a loaded image first")
     return p.source_image
+
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".tga", ".exr", ".hdr")
+
+
+def folder_images(folder):
+    """Image files directly inside a folder, sorted by name."""
+    path = bpy.path.abspath(folder) if folder else ""
+    if not path or not os.path.isdir(path):
+        return []
+    return [os.path.join(path, f) for f in sorted(os.listdir(path), key=str.lower)
+            if f.lower().endswith(IMAGE_EXTS) and os.path.isfile(os.path.join(path, f))]
 
 
 # ---------------------------------------------------------------------------
@@ -2203,7 +2853,33 @@ class PreviewRig:
         except AttributeError:
             pass
         bg = world.node_tree.nodes.get("Background") if world.node_tree else None
-        if bg:
+        lighting = p.preview_lighting
+        hdri = preview_hdri_image(p) if lighting not in ("STUDIO", "SUN") else None
+        if lighting not in ("STUDIO", "SUN") and hdri is None:
+            lighting = "STUDIO"  # file missing: fall back rather than fail
+        self.lighting = lighting
+        if bg and hdri is not None:
+            env = world.node_tree.nodes.new("ShaderNodeTexEnvironment")
+            env.image = hdri
+            world.node_tree.links.new(env.outputs["Color"], bg.inputs["Color"])
+            bg.inputs["Strength"].default_value = 1.0
+        elif bg and lighting == "SUN":
+            wn, wl = world.node_tree.nodes, world.node_tree.links
+            tc = wn.new("ShaderNodeTexCoord")
+            sep = wn.new("ShaderNodeSeparateXYZ")
+            rng_node = wn.new("ShaderNodeMapRange")
+            rng_node.inputs["From Min"].default_value = -0.1
+            rng_node.inputs["From Max"].default_value = 0.4
+            mix = wn.new("ShaderNodeMix")
+            mix.data_type = "RGBA"
+            _socket(mix.inputs, "A_Color", 6).default_value = (0.16, 0.13, 0.10, 1.0)
+            _socket(mix.inputs, "B_Color", 7).default_value = (0.35, 0.55, 0.95, 1.0)
+            wl.new(tc.outputs["Generated"], sep.inputs["Vector"])
+            wl.new(sep.outputs["Z"], rng_node.inputs["Value"])
+            wl.new(rng_node.outputs["Result"], mix.inputs[0])
+            wl.new(_socket(mix.outputs, "Result_Color", 2), bg.inputs["Color"])
+            bg.inputs["Strength"].default_value = 1.0
+        elif bg:
             # Sky-to-ground gradient: gives glossy surfaces something to reflect, so
             # low roughness shows a sharp horizon and high roughness a soft blur.
             wn, wl = world.node_tree.nodes, world.node_tree.links
@@ -2242,6 +2918,11 @@ class PreviewRig:
         if p.preview_shape == "MONKEY":
             mod = self.shape_obj.modifiers.new("Subdivision", "SUBSURF")
             mod.levels = mod.render_levels = 2
+        if p.use_displacement and p.preview_shape != "SELECTED":
+            # Enough faces for the displacement to show, as it will on your object.
+            mod = self.shape_obj.modifiers.new("PBR Displacement", "SUBSURF")
+            mod.subdivision_type = "SIMPLE"
+            mod.levels = mod.render_levels = 3
         self.cam_loc = _preview_cam_loc(p.preview_shape)
         self.fill = 1.9 if p.preview_view == "CLOSEUP" else 0.8
 
@@ -2274,12 +2955,20 @@ class PreviewRig:
         #  - two low "reflection cards" sit where the camera sees their mirror image
         #    in the front and right faces: glossy = sharp bright sheen, rough = none
         # The lights stay put while the shape turns, like a turntable in a studio.
-        for name, energy, loc, sz in (("Key", 900, (-4.0, -2.5, 2.4), 0.8),
-                                      ("Soft", 300, (2.0, -3.0, 5.5), 6.0),
-                                      ("Fill", 60, (5.0, -1.0, 1.0), 4.0),
-                                      ("Rim", 300, (0.5, 5.0, 3.0), 2.0),
-                                      ("ReflectFront", 220, (-3.0, -4.5, -2.4), 1.0),
-                                      ("ReflectSide", 220, (4.5, 3.0, -2.4), 1.0)):
+        if self.lighting == "SUN":
+            # Low-ish afternoon sun from the side, so bumps cast clear shadows.
+            ld = bpy.data.lights.new("PBRGenPreview_Sun", "SUN")
+            ld.energy = 4.5
+            ld.angle = math.radians(1.5)
+            ld.color = (1.0, 0.96, 0.9)
+            _aim(add("PBRGenPreview_Sun", ld, center + Vector((-4.0, -3.0, 3.2)) * k), center)
+        lights = (("Key", 900, (-4.0, -2.5, 2.4), 0.8),
+                  ("Soft", 300, (2.0, -3.0, 5.5), 6.0),
+                  ("Fill", 60, (5.0, -1.0, 1.0), 4.0),
+                  ("Rim", 300, (0.5, 5.0, 3.0), 2.0),
+                  ("ReflectFront", 220, (-3.0, -4.5, -2.4), 1.0),
+                  ("ReflectSide", 220, (4.5, 3.0, -2.4), 1.0)) if self.lighting == "STUDIO" else ()
+        for name, energy, loc, sz in lights:
             ld = bpy.data.lights.new("PBRGenPreview_" + name, "AREA")
             ld.energy = energy * k * k  # light falls off with distance squared
             ld.size = sz * k
@@ -2296,7 +2985,7 @@ class PreviewRig:
         cam.data.shift_x = cam.data.shift_y = 0.0
         scene.render.resolution_x = scene.render.resolution_y = size
         # Close-up zooms in until the surface fills the frame, so detail is easy to judge.
-        _frame_object(scene, cam, self.mesh, fill=self.fill, matrix=matrix)
+        _frame_object(scene, cam, self.mesh, fill=self.fill * p.preview_zoom, matrix=matrix)
         if scene.render.engine == "CYCLES":
             scene.cycles.samples = samples
         elif hasattr(scene, "eevee"):
@@ -2331,6 +3020,35 @@ class PreviewRig:
         self.scene = self.world = self.mat = None
 
 
+HDRI_FILES = {"FOREST": "forest.exr", "CITY": "city.exr", "COURTYARD": "courtyard.exr",
+              "INTERIOR": "interior.exr", "NIGHT": "night.exr", "SUNRISE": "sunrise.exr", "SUNSET": "sunset.exr"}
+
+
+def preview_hdri_image(p):
+    """The HDRI image for the chosen preview lighting, or None if it can't be found.
+    It stays loaded (hidden) between previews, because big HDRIs are slow to read."""
+    if p.preview_lighting == "CUSTOM":
+        path = bpy.path.abspath(p.preview_hdri) if p.preview_hdri else ""
+    else:
+        name = HDRI_FILES.get(p.preview_lighting)
+        root = bpy.utils.system_resource("DATAFILES", path=os.path.join("studiolights", "world"))
+        path = os.path.join(root, name) if name and root else ""
+    if not path or not os.path.isfile(path):
+        return None
+    key = ".PBRGen HDRI " + os.path.basename(path)
+    img = bpy.data.images.get(key)
+    if img is not None and bpy.path.abspath(img.filepath) == path:
+        return img
+    if img is not None:
+        bpy.data.images.remove(img)
+    try:
+        img = bpy.data.images.load(path, check_existing=False)
+    except RuntimeError:
+        return None
+    img.name = key
+    return img
+
+
 def render_preview(arrays, p, size=512):
     """Render the maps on the chosen shape in a temporary scene; returns PNG path."""
     if p.preview_view == "MAPS":
@@ -2363,6 +3081,7 @@ def show_preview(path):
     img.pixels.foreach_get(buf)
     prev.image_size = (w, h)
     prev.image_pixels_float.foreach_set(buf)
+    _preview_state["pixels"] = buf.reshape(h, w, 4)
 
     old = _preview_state["last_path"]
     if old and old != path and os.path.isfile(old):
@@ -2539,7 +3258,7 @@ build a material from them and put it on the selected object"""
 
         def work(stage):
             stage("making maps")
-            arrays = image_arrays(rgb, settings)
+            arrays = add_engine_maps(image_arrays(rgb, settings), settings.pack_maps)
             stage("encoding images")
             return encode_maps(arrays)
 
@@ -2573,7 +3292,7 @@ build a material and put it on the selected object"""
 
         def work(stage):
             stage("making %dpx maps" % size)
-            arrays = procedural_arrays(settings, size)
+            arrays = add_engine_maps(procedural_arrays(settings, size), settings.pack_maps)
             stage("encoding images")
             return encode_maps(arrays)
 
@@ -2582,6 +3301,188 @@ build a material and put it on the selected object"""
             finish(self, context, base + "_PBR", maps, context.scene.pbrgen, replace)
 
         return self.start_job(context, "%s %dpx" % (label, size), work, done)
+
+
+class PBRGEN_OT_batch_folder(_ExistingChoice, bpy.types.Operator):
+    """Turn every image in the chosen folder into its own set of PBR maps and material. \
+Runs in the background, one image at a time; press Esc to stop after the current image"""
+    bl_idname = "pbrgen.batch_folder"
+    bl_label = "Convert All Images in Folder"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @staticmethod
+    def base_name(path):
+        return bpy.path.clean_name(os.path.splitext(os.path.basename(path))[0]) or "Image"
+
+    def existing_names(self, context):
+        names = [self.base_name(f) + "_PBR" for f in folder_images(context.scene.pbrgen.folder_path)]
+        return [n for n in names if n in bpy.data.materials]
+
+    def material_name(self, context):
+        found = self.existing_names(context)
+        return found[0] if found else ""
+
+    def draw(self, context):
+        layout = self.layout
+        n = len(self.existing_names(context))
+        layout.label(text="%d of these materials already exist." % n, icon="INFO")
+        layout.prop(self, "existing", expand=True)
+        layout.label(text="Change this in Output Settings > If It Already Exists")
+
+    def execute(self, context):
+        p = context.scene.pbrgen
+        self.files = folder_images(p.folder_path)
+        if not self.files:
+            self.report({"ERROR"}, "Choose a folder that has images in it first")
+            return {"CANCELLED"}
+        if _JOB["running"]:
+            self.report({"WARNING"}, "Already generating a texture; wait for it to finish")
+            return {"CANCELLED"}
+        self.replace = self.use_replace(context)
+        self.made, self.skipped = [], []
+        self.t0 = time.time()
+        if bpy.app.background or context.window is None:  # scripts / command line: just run it
+            for path in self.files:
+                job = self.read(context, path)
+                if job is not None:
+                    self.create(context, job, self.compute(job))
+            return self.report_done()
+        self.index = 0
+        self.job = None
+        self.cancelled = False
+        _JOB["running"] = True
+        wm = context.window_manager
+        self.timer = wm.event_timer_add(0.1, window=context.window)
+        wm.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    # Steps for one image: read pixels (main thread), make + encode maps (worker
+    # thread, Blender stays responsive), create images and material (main thread).
+    def read(self, context, path):
+        p = context.scene.pbrgen
+        base = self.base_name(path)
+        before = set(bpy.data.images)
+        img = None
+        try:
+            img = bpy.data.images.load(path, check_existing=True)
+            rgb = read_rgb(img, p.max_size)
+        except Exception as e:  # noqa: BLE001
+            self.skipped.append("%s (%s)" % (os.path.basename(path), e))
+            return None
+        finally:
+            if img is not None and img not in before:
+                bpy.data.images.remove(img)  # don't leave every source photo in the file
+        return {"base": base, "rgb": rgb, "settings": snapshot_settings(p), "out_dir": p.out_dir}
+
+    @staticmethod
+    def compute(job):
+        s = job["settings"]
+        return encode_maps(add_engine_maps(image_arrays(job["rgb"], s), s.pack_maps))
+
+    def create(self, context, job, encoded):
+        maps = images_from_encoded(job["base"], encoded, job["out_dir"], self.replace)
+        mat = finish(self, context, job["base"] + "_PBR", maps, context.scene.pbrgen,
+                     self.replace, assign=False, quiet=True)
+        self.made.append(mat.name)
+
+    def report_done(self):
+        msg = "Made %d material%s from the folder in %.1fs" % (
+            len(self.made), "" if len(self.made) == 1 else "s", time.time() - self.t0)
+        if self.skipped:
+            msg += ". Skipped: " + ", ".join(self.skipped)
+            self.report({"WARNING"}, msg)
+        else:
+            self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+    def status(self, context, text=None):
+        try:
+            context.workspace.status_text_set(text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def modal(self, context, event):
+        if event.type == "ESC" and event.value == "PRESS":
+            self.cancelled = True
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        job = self.job
+        if job is not None:
+            if not job["done"]:
+                return {"PASS_THROUGH"}
+            self.job = None
+            if job["error"] is not None:
+                self.skipped.append("%s (%s)" % (job["base"], job["error"]))
+            else:
+                try:
+                    self.create(context, job, job["result"])
+                except Exception as e:  # noqa: BLE001
+                    self.skipped.append("%s (%s)" % (job["base"], e))
+        if self.cancelled or self.index >= len(self.files):
+            return self.stop(context)
+        path = self.files[self.index]
+        self.index += 1
+        self.status(context, "PBR Maps: converting folder - image %d of %d (%s). Esc to stop."
+                    % (self.index, len(self.files), os.path.basename(path)))
+        job = self.read(context, path)
+        if job is None:
+            return {"PASS_THROUGH"}
+        job.update(done=False, error=None, result=None)
+
+        def run(job=job):
+            try:
+                job["result"] = self.compute(job)
+            except Exception as e:  # noqa: BLE001
+                job["error"] = e
+            finally:
+                job["done"] = True
+
+        self.job = job
+        threading.Thread(target=run, daemon=True, name="pbrgen-batch").start()
+        return {"PASS_THROUGH"}
+
+    def stop(self, context):
+        context.window_manager.event_timer_remove(self.timer)
+        self.status(context, None)
+        _JOB["running"] = False
+        if self.cancelled:
+            self.skipped.append("stopped with Esc after %d of %d" % (self.index, len(self.files)))
+        return self.report_done()
+
+    def cancel(self, context):
+        _JOB["running"] = False
+        self.status(context, None)
+
+
+PRESET_SUBDIR = "pbr_map_generator/textures"
+
+
+def _preset_values():
+    """Every Texture Generator setting a saved preset stores. The pattern comes
+    first: choosing it loads that pattern's defaults, then the rest overrides them."""
+    names = [prop.identifier for prop in PBRGEN_Props.bl_rna.properties
+             if prop.identifier.startswith(("tex_", "weather_")) and prop.identifier not in ("tex_pattern", "tex_res")]
+    return ["p.tex_pattern"] + ["p." + n for n in names]
+
+
+class PBRGEN_MT_tex_presets(bpy.types.Menu):
+    """Your saved Texture Generator settings. Pick one to load it"""
+    bl_label = "Presets"
+    bl_idname = "PBRGEN_MT_tex_presets"
+    preset_subdir = PRESET_SUBDIR
+    preset_operator = "script.execute_preset"
+    draw = bpy.types.Menu.draw_preset
+
+
+class PBRGEN_OT_add_tex_preset(AddPresetBase, bpy.types.Operator):
+    """Save the current Texture Generator settings (pattern, colors, weathering...) \
+as a preset you can load again in any project"""
+    bl_idname = "pbrgen.add_tex_preset"
+    bl_label = "Save Texture Preset"
+    preset_menu = "PBRGEN_MT_tex_presets"
+    preset_subdir = PRESET_SUBDIR
+    preset_defines = ["p = bpy.context.scene.pbrgen"]
+    preset_values = []  # filled in at register(), once the settings exist
 
 
 class PBRGEN_OT_preview(bpy.types.Operator):
@@ -2600,8 +3501,11 @@ Nothing is added to your scene"""
             path = render_preview(arrays, p)
         except Exception as e:  # noqa: BLE001
             self.report({"ERROR"}, "Preview failed: %s" % e)
+            _set_preview_error(str(e))
             return {"CANCELLED"}
+        drop_live_rig()
         show_preview(path)
+        _set_preview_error("")
         return {"FINISHED"}
 
 
@@ -2617,6 +3521,96 @@ def preview_arrays(op, p):
 
 DRAG_QUALITY = (256, 4)  # size in pixels and render samples while dragging (smooth)
 DRAG_SPEED = 0.01        # radians turned per pixel of mouse movement
+ZOOM_STEP = 1.12         # zoom change per mouse-wheel notch
+
+# While you drag or scroll on the preview, the preview scene is built once and
+# kept ("live"), so each frame only turns or zooms the shape and re-renders.
+# It's freed right after the final full-quality frame, and whenever a setting
+# changes (the shape or material would be out of date).
+_live = {"rig": None}
+
+
+def drop_live_rig():
+    rig, _live["rig"] = _live["rig"], None
+    if bpy.app.timers.is_registered(_final_live_render):
+        bpy.app.timers.unregister(_final_live_render)
+    if rig is not None:
+        try:
+            rig.free()
+        except ReferenceError:  # its data went away with a file load
+            pass
+
+
+def live_rig(op, p):
+    if _live["rig"] is None:
+        arrays = preview_arrays(op, p)
+        if arrays is None:
+            return None
+        _live["rig"] = PreviewRig(arrays, p)
+    return _live["rig"]
+
+
+def set_view(p, **values):
+    """Change spin / tilt / zoom without triggering a full re-render."""
+    _preview_state["interactive"] = True
+    try:
+        for k, v in values.items():
+            setattr(p, k, v)
+    finally:
+        _preview_state["interactive"] = False
+
+
+def _final_live_render():
+    rig = _live["rig"]
+    if rig is not None:
+        try:
+            show_preview(rig.render(bpy.context.scene.pbrgen, 512, 24))
+            _preview_state["error"] = ""
+        except Exception as e:  # noqa: BLE001
+            _preview_state["error"] = str(e)
+        finally:
+            _live["rig"] = None
+            try:
+                rig.free()
+            except ReferenceError:
+                pass
+    return None
+
+
+def schedule_final_render(delay):
+    if bpy.app.timers.is_registered(_final_live_render):
+        bpy.app.timers.unregister(_final_live_render)
+    bpy.app.timers.register(_final_live_render, first_interval=delay)
+
+
+def preview_under_mouse(context, event):
+    """True if the mouse is over a preview image (sidebar or viewport corner) that
+    can be turned (not the flat Maps view)."""
+    scene = context.scene
+    if scene is None or not hasattr(scene, "pbrgen"):
+        return False
+    pcoll = preview_collections.get("main")
+    if scene.pbrgen.preview_view == "MAPS" or pcoll is None or "preview" not in pcoll:
+        return False
+    area, region = context.area, context.region
+    if area is None or region is None or area.type != "VIEW_3D":
+        return False
+    x, y = event.mouse_region_x, event.mouse_region_y
+    if region.type == "UI":
+        if not (_draw_state["sidebar_image"].get(region.as_pointer())
+                and sidebar_preview_visible(area)):
+            return False
+        x0, y0, x1, y1 = (_draw_state["sidebar_found"].get(region.as_pointer())
+                          or sidebar_preview_rect(region))
+    elif region.type == "WINDOW":
+        if (not scene.pbrgen.preview_in_viewport
+                or bpy.data.images.get(PREVIEW_IMAGE_NAME) is None
+                or not viewport_preview_wanted(area)):
+            return False
+        x0, y0, x1, y1 = viewport_preview_rect(context, area, region)
+    else:
+        return False
+    return x0 <= x <= x1 and y0 <= y <= y1
 
 
 class PBRGEN_OT_drag_preview(bpy.types.Operator):
@@ -2625,48 +3619,21 @@ class PBRGEN_OT_drag_preview(bpy.types.Operator):
     bl_label = "Rotate Preview"
     bl_options = {"INTERNAL"}
 
-    @staticmethod
-    def over_preview(context, event):
-        """True if the mouse is over a preview image (sidebar or viewport corner)."""
-        area, region = context.area, context.region
-        if area is None or region is None or area.type != "VIEW_3D":
-            return False
-        x, y = event.mouse_region_x, event.mouse_region_y
-        if region.type == "UI":
-            if not (_draw_state["sidebar_image"].get(region.as_pointer())
-                    and sidebar_preview_visible(area)):
-                return False
-            x0, y0, x1, y1 = sidebar_preview_rect(region)
-        elif region.type == "WINDOW":
-            if (not context.scene.pbrgen.preview_in_viewport
-                    or bpy.data.images.get(PREVIEW_IMAGE_NAME) is None
-                    or not viewport_preview_wanted(area)):
-                return False
-            x0, y0, x1, y1 = viewport_preview_rect(context, area, region)
-        else:
-            return False
-        return x0 <= x <= x1 and y0 <= y <= y1
-
     def invoke(self, context, event):
         # This runs for every left click in the 3D view, so get out of the way quickly.
-        if context.scene is None or not hasattr(context.scene, "pbrgen"):
+        if _preview_state.get("interactive") or not preview_under_mouse(context, event):
             return {"PASS_THROUGH"}
+        # Two quick clicks in the same spot reset the view (backs up Blender's own
+        # double-click event, which some input devices and remote desktops don't send).
+        last = _preview_state.get("last_click")
+        limit = context.preferences.inputs.mouse_double_click_time / 1000.0
+        if (last and time.time() - last[0] < limit
+                and abs(event.mouse_x - last[1]) < 6 and abs(event.mouse_y - last[2]) < 6):
+            _preview_state["last_click"] = None
+            return bpy.ops.pbrgen.reset_preview_rotation()
         p = context.scene.pbrgen
-        pcoll = preview_collections.get("main")
-        if (p.preview_view == "MAPS" or pcoll is None or "preview" not in pcoll
-                or _preview_state.get("dragging") or not self.over_preview(context, event)):
-            return {"PASS_THROUGH"}
-        try:
-            arrays = preview_arrays(self, p)
-            if arrays is None:
-                return {"CANCELLED"}
-            self.rig = PreviewRig(arrays, p)
-        except Exception as e:  # noqa: BLE001
-            self.report({"ERROR"}, "Preview failed: %s" % e)
-            return {"CANCELLED"}
         self.start = (event.mouse_x, event.mouse_y, p.preview_spin, p.preview_tilt)
-        self.dirty = False
-        _preview_state["dragging"] = True
+        self.moved = self.dirty = False
         wm = context.window_manager
         self.timer = wm.event_timer_add(1 / 60, window=context.window)
         context.window.cursor_modal_set("HAND")
@@ -2675,53 +3642,100 @@ class PBRGEN_OT_drag_preview(bpy.types.Operator):
 
     def modal(self, context, event):
         p = context.scene.pbrgen
+        x0, y0, spin0, tilt0 = self.start
         if event.type in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE"}:
-            x0, y0, spin0, tilt0 = self.start
+            dx, dy = event.mouse_x - x0, event.mouse_y - y0
+            if not self.moved and dx * dx + dy * dy < 9:
+                return {"RUNNING_MODAL"}  # a plain click doesn't turn anything
+            self.moved = True
             ui = context.preferences.system.ui_scale
-            spin = spin0 + (event.mouse_x - x0) * DRAG_SPEED / ui
-            p.preview_spin = (spin + math.pi) % (2 * math.pi) - math.pi  # keep turning past 180°
-            p.preview_tilt = max(-math.pi / 2, min(math.pi / 2, tilt0 - (event.mouse_y - y0) * DRAG_SPEED / ui))
+            spin = spin0 + dx * DRAG_SPEED / ui
+            set_view(p, preview_spin=(spin + math.pi) % (2 * math.pi) - math.pi,  # keep turning past 180°
+                     preview_tilt=max(-math.pi / 2, min(math.pi / 2, tilt0 - dy * DRAG_SPEED / ui)))
             self.dirty = True
         elif event.type == "TIMER":
-            # Mouse moves just record where the mouse is; rendering happens here, at
+            # Mouse moves only record where the mouse is; rendering happens here, at
             # most once per tick, so the preview never falls behind the mouse.
             if self.dirty:
                 self.dirty = False
-                self.show(p, *DRAG_QUALITY)
+                try:
+                    rig = live_rig(self, p)  # built on the first movement, then reused
+                    if rig is None:
+                        return self.end(context)
+                    show_preview(rig.render(p, *DRAG_QUALITY))
+                except Exception as e:  # noqa: BLE001
+                    self.report({"ERROR"}, "Preview failed: %s" % e)
+                    return self.end(context)
         elif event.type == "LEFTMOUSE" and event.value == "RELEASE":
-            return self.finish(context)
+            return self.end(context)
         elif event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
-            p.preview_spin, p.preview_tilt = self.start[2], self.start[3]
-            return self.finish(context)
+            set_view(p, preview_spin=spin0, preview_tilt=tilt0)
+            return self.end(context)
         return {"RUNNING_MODAL"}
 
-    def show(self, p, size, samples):
-        try:
-            show_preview(self.rig.render(p, size, samples))
-        except Exception as e:  # noqa: BLE001
-            self.report({"ERROR"}, "Preview failed: %s" % e)
-
-    def finish(self, context):
-        try:
-            self.show(context.scene.pbrgen, 512, 24)  # full quality where you let go
-        finally:
-            self.rig.free()
-            context.window_manager.event_timer_remove(self.timer)
-            context.window.cursor_modal_restore()
-            _preview_state["dragging"] = False
+    def end(self, context):
+        context.window_manager.event_timer_remove(self.timer)
+        context.window.cursor_modal_restore()
+        if self.moved:
+            schedule_final_render(0.0)  # full quality where you let go
+            _preview_state["last_click"] = None
+        else:
+            _preview_state["last_click"] = (time.time(), self.start[0], self.start[1])
         return {"FINISHED"}
 
 
+class PBRGEN_OT_zoom_preview(bpy.types.Operator):
+    """Scroll over the preview image to zoom in and out"""
+    bl_idname = "pbrgen.zoom_preview"
+    bl_label = "Zoom Preview"
+    bl_options = {"INTERNAL"}
+
+    direction: IntProperty(default=1)
+
+    def invoke(self, context, event):
+        if _preview_state.get("interactive") or not preview_under_mouse(context, event):
+            return {"PASS_THROUGH"}
+        p = context.scene.pbrgen
+        zoom = max(0.4, min(4.0, p.preview_zoom * ZOOM_STEP ** self.direction))
+        if abs(zoom - p.preview_zoom) < 1e-6:
+            return {"FINISHED"}
+        set_view(p, preview_zoom=zoom)
+        try:
+            rig = live_rig(self, p)
+            if rig is None:
+                return {"CANCELLED"}
+            show_preview(rig.render(p, *DRAG_QUALITY))
+        except Exception as e:  # noqa: BLE001
+            self.report({"ERROR"}, "Preview failed: %s" % e)
+            return {"CANCELLED"}
+        schedule_final_render(0.35)  # full quality once you stop scrolling
+        return {"FINISHED"}
+
+
+class PBRGEN_OT_preview_double_click(bpy.types.Operator):
+    """Double-click the preview image to put the shape back to its default view"""
+    bl_idname = "pbrgen.preview_double_click"
+    bl_label = "Reset Preview View"
+    bl_options = {"INTERNAL"}
+
+    def invoke(self, context, event):
+        if _preview_state.get("interactive") or not preview_under_mouse(context, event):
+            return {"PASS_THROUGH"}
+        return bpy.ops.pbrgen.reset_preview_rotation()
+
+
 class PBRGEN_OT_reset_preview_rotation(bpy.types.Operator):
-    """Put the preview shape back to its default position (no spin or tilt)"""
+    """Put the preview shape back to its default view: no spin, no tilt and normal zoom. \
+You can also double-click the preview image"""
     bl_idname = "pbrgen.reset_preview_rotation"
-    bl_label = "Reset Position"
+    bl_label = "Reset View"
     bl_options = {"INTERNAL"}
 
     def execute(self, context):
         p = context.scene.pbrgen
         p.preview_spin = 0.0
         p.preview_tilt = 0.0
+        p.preview_zoom = 1.0
         return {"FINISHED"}
 
 
@@ -2760,15 +3774,22 @@ class PBRGEN_PT_preview(PBRGEN_PT_base, bpy.types.Panel):
             else:
                 # Lets a click on the image start a drag-to-rotate (see _note_sidebar_drawn)
                 _draw_state["sidebar_drawing"][context.region.as_pointer()] = True
-                row = layout.row(align=True)
-                row.label(text="Drag to rotate", icon="ORIENTATION_GIMBAL")
-                sub = row.row(align=True)
-                sub.enabled = abs(p.preview_spin) > 1e-6 or abs(p.preview_tilt) > 1e-6
-                sub.operator("pbrgen.reset_preview_rotation", text="Reset", icon="LOOP_BACK")
+                layout.label(text="Drag to rotate, scroll to zoom", icon="ORIENTATION_GIMBAL")
         else:
             box = layout.box()
             box.label(text="No preview yet", icon="INFO")
             box.label(text="Press Update Preview below")
+        if _preview_state.get("error"):
+            layout.label(text=_preview_state["error"], icon="ERROR")
+        if p.preview_view != "MAPS":
+            row = layout.row(align=True)
+            row.prop(p, "preview_lighting", text="")
+            sub = row.row(align=True)
+            sub.enabled = (abs(p.preview_spin) > 1e-6 or abs(p.preview_tilt) > 1e-6
+                           or abs(p.preview_zoom - 1.0) > 1e-6)
+            sub.operator("pbrgen.reset_preview_rotation", text="Reset", icon="LOOP_BACK")
+            if p.preview_lighting == "CUSTOM":
+                layout.prop(p, "preview_hdri", text="")
 
         row = layout.row(align=True)
         row.prop(p, "preview_shape", expand=True, icon_only=True)
@@ -2810,9 +3831,19 @@ class PBRGEN_PT_image(PBRGEN_PT_base, bpy.types.Panel):
             layout.prop(p, "filepath", text="")
         elif p.source_mode == "URL":
             layout.prop(p, "url", text="", icon="URL")
+        elif p.source_mode == "FOLDER":
+            layout.prop(p, "folder_path", text="")
+            n = len(folder_images(p.folder_path))
+            layout.label(text="%d image%s found" % (n, "" if n == 1 else "s") if p.folder_path
+                         else "Choose a folder of images", icon="FILE_FOLDER")
         else:
             layout.template_ID(p, "source_image", open="image.open")
         layout.prop(p, "max_size")
+        row = layout.row(align=True)
+        row.prop(p, "make_seamless", toggle=True, icon="MOD_ARRAY")
+        sub = row.row(align=True)
+        sub.active = p.make_seamless
+        sub.prop(p, "seamless_width", text="Width")
 
         col = layout.column(align=True)
         col.label(text="Height / Bump")
@@ -2828,7 +3859,10 @@ class PBRGEN_PT_image(PBRGEN_PT_base, bpy.types.Panel):
         col.prop(p, "rough_max")
         col.prop(p, "invert_roughness")
 
-        layout.operator("pbrgen.from_image", icon="IMAGE_DATA")
+        if p.source_mode == "FOLDER":
+            layout.operator("pbrgen.batch_folder", icon="FILE_FOLDER")
+        else:
+            layout.operator("pbrgen.from_image", icon="IMAGE_DATA")
 
 
 class PBRGEN_PT_procedural(PBRGEN_PT_base, bpy.types.Panel):
@@ -2839,6 +3873,10 @@ class PBRGEN_PT_procedural(PBRGEN_PT_base, bpy.types.Panel):
         p = context.scene.pbrgen
         sync_viewport_overlay(context)
         layout = self.layout
+        row = layout.row(align=True)
+        row.menu("PBRGEN_MT_tex_presets", text=PBRGEN_MT_tex_presets.bl_label, icon="PRESET")
+        row.operator("pbrgen.add_tex_preset", text="", icon="ADD")
+        row.operator("pbrgen.add_tex_preset", text="", icon="REMOVE").remove_active = True
         layout.prop(p, "tex_pattern")
         layout.prop(p, "tex_res")
 
@@ -2864,6 +3902,27 @@ class PBRGEN_PT_procedural(PBRGEN_PT_base, bpy.types.Panel):
         layout.operator("pbrgen.procedural", icon="TEXTURE")
 
 
+class PBRGEN_PT_weathering(PBRGEN_PT_base, bpy.types.Panel):
+    bl_label = "Weathering"
+    bl_idname = "PBRGEN_PT_weathering"
+    bl_parent_id = "PBRGEN_PT_procedural"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon="BRUSHES_ALL")
+
+    def draw(self, context):
+        p = context.scene.pbrgen
+        col = self.layout.column(align=True)
+        col.prop(p, "weather_dirt", slider=True)
+        col.prop(p, "weather_moss", slider=True)
+        row = col.row()
+        row.active = p.weather_moss > 0
+        row.prop(p, "weather_moss_color")
+        col.prop(p, "weather_rust", slider=True)
+        col.prop(p, "weather_edges", slider=True)
+
+
 class PBRGEN_PT_output(PBRGEN_PT_base, bpy.types.Panel):
     bl_label = "Output Settings"
     bl_idname = "PBRGEN_PT_output"
@@ -2885,9 +3944,19 @@ class PBRGEN_PT_output(PBRGEN_PT_base, bpy.types.Panel):
         layout.prop(p, "ao_mix")
         layout.prop(p, "use_displacement")
         if p.use_displacement:
-            layout.prop(p, "displacement_scale")
+            col = layout.column(align=True)
+            col.prop(p, "displacement_scale")
+            row = col.row(align=True)
+            row.prop(p, "displacement_subdivide")
+            sub = row.row(align=True)
+            sub.active = p.displacement_subdivide
+            sub.prop(p, "displacement_levels")
+            if context.scene.render.engine not in ("CYCLES",):
+                col.label(text="Shows best when rendered in Cycles", icon="INFO")
         layout.prop(p, "assign_to_active")
         layout.prop(p, "on_existing")
+        layout.prop(p, "mark_as_asset")
+        layout.prop(p, "pack_maps")
         layout.prop(p, "out_dir")
 
 
@@ -2895,12 +3964,18 @@ classes = (
     PBRGEN_Props,
     PBRGEN_OT_from_image,
     PBRGEN_OT_procedural,
+    PBRGEN_OT_batch_folder,
+    PBRGEN_MT_tex_presets,
+    PBRGEN_OT_add_tex_preset,
     PBRGEN_OT_preview,
     PBRGEN_OT_drag_preview,
+    PBRGEN_OT_zoom_preview,
+    PBRGEN_OT_preview_double_click,
     PBRGEN_OT_reset_preview_rotation,
     PBRGEN_PT_preview,
     PBRGEN_PT_image,
     PBRGEN_PT_procedural,
+    PBRGEN_PT_weathering,
     PBRGEN_PT_output,
 )
 
@@ -2914,6 +3989,7 @@ def register():
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.pbrgen = PointerProperty(type=PBRGEN_Props)
+    PBRGEN_OT_add_tex_preset.preset_values = _preset_values()
     if not bpy.app.background:
         _draw_state["handle"] = bpy.types.SpaceView3D.draw_handler_add(
             _draw_viewport_preview, (), "WINDOW", "POST_PIXEL")
@@ -2924,7 +4000,18 @@ def register():
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc is not None:
         km = kc.keymaps.new(name="3D View Generic", space_type="VIEW_3D")
-        addon_keymaps.append((km, km.keymap_items.new("pbrgen.drag_preview", "LEFTMOUSE", "PRESS")))
+        items = km.keymap_items
+        addon_keymaps.append((km, items.new("pbrgen.preview_double_click", "LEFTMOUSE", "DOUBLE_CLICK")))
+        addon_keymaps.append((km, items.new("pbrgen.drag_preview", "LEFTMOUSE", "PRESS")))
+        # The sidebar scrolls on the mouse wheel before "3D View Generic" sees it,
+        # so zooming also goes in the sidebar's scrolling keymap (the operator lets
+        # every wheel turn that isn't over the preview image pass straight through).
+        km2 = kc.keymaps.new(name="View2D Buttons List", space_type="EMPTY")
+        for keymap in (km, km2):
+            for event, step in (("WHEELUPMOUSE", 1), ("WHEELDOWNMOUSE", -1)):
+                kmi = keymap.keymap_items.new("pbrgen.zoom_preview", event, "PRESS")
+                kmi.properties.direction = step
+                addon_keymaps.append((keymap, kmi))
     _subscribe_selection()
     bpy.app.handlers.load_post.append(_on_file_loaded)
     bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
@@ -2951,6 +4038,7 @@ def unregister():
         bpy.data.images.remove(img)
     if bpy.app.timers.is_registered(_run_preview_timer):
         bpy.app.timers.unregister(_run_preview_timer)
+    drop_live_rig()
     del bpy.types.Scene.pbrgen
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
