@@ -16,7 +16,7 @@ Find it in the 3D Viewport sidebar (N key) under the "PBR Maps" tab.
 bl_info = {
     "name": "PBR Map Generator",
     "author": "PBR Map Generator",
-    "version": (1, 6, 0),
+    "version": (1, 7, 0),
     "blender": (3, 6, 0),
     "location": "3D Viewport > Sidebar (N) > PBR Maps",
     "description": "Generate normal, bump, roughness and AO maps from images, plus procedural textures",
@@ -39,6 +39,7 @@ import bmesh
 import bpy
 import gpu
 import numpy as np
+from bpy.app.handlers import persistent
 from bpy_extras.object_utils import world_to_camera_view
 from gpu_extras.batch import batch_for_shader
 from mathutils import Matrix, Vector
@@ -1417,6 +1418,47 @@ def _on_shape_change(self, context):
         _queue_preview(context, force=True)
 
 
+# --- Keep a "Selected Object" preview in sync with the scene -----------------
+_MSGBUS_OWNER = object()
+
+
+def _previewing_selected():
+    scene = bpy.context.scene
+    return (scene is not None and hasattr(scene, "pbrgen")
+            and scene.pbrgen.preview_shape == "SELECTED" and scene.pbrgen.preview_live)
+
+
+def _on_active_object_changed():
+    """A different object was selected (made active)."""
+    if _previewing_selected():
+        _queue_preview(bpy.context)
+
+
+@persistent
+def _on_depsgraph_update(scene, depsgraph):
+    """The selected object's shape changed (edited, modifier tweaked...)."""
+    if bpy.app.background or not _previewing_selected():
+        return
+    active = bpy.context.view_layer.objects.active if bpy.context.view_layer else None
+    if active is None:
+        return
+    for update in depsgraph.updates:
+        if update.is_updated_geometry and update.id.original in (active, active.data):
+            _queue_preview(bpy.context)
+            return
+
+
+def _subscribe_selection():
+    bpy.msgbus.clear_by_owner(_MSGBUS_OWNER)
+    bpy.msgbus.subscribe_rna(key=(bpy.types.LayerObjects, "active"), owner=_MSGBUS_OWNER,
+                             args=(), notify=_on_active_object_changed)
+
+
+@persistent
+def _on_file_loaded(_dummy=None):
+    _subscribe_selection()  # message-bus subscriptions are cleared when a file loads
+
+
 def _redraw_viewports(self=None, context=None):
     wm = bpy.context.window_manager
     for win in wm.windows:
@@ -1566,6 +1608,10 @@ class PBRGEN_Props(bpy.types.PropertyGroup):
             ("TORUS", "Torus", "Preview on a torus (donut)", "MESH_TORUS", 4),
             ("MONKEY", "Suzanne", "Preview on Suzanne, Blender's monkey head", "MESH_MONKEY", 5),
             ("PLANE", "Plane", "Preview on a flat plane, good for floors and walls", "MESH_PLANE", 6),
+            ("SELECTED", "Selected Object",
+             "Preview on the object you have selected, exactly as it is in your scene: "
+             "its shape, modifiers, rotation, scale and UV map. Updates when you select another object",
+             "RESTRICT_SELECT_OFF", 7),
         ],
         default="SPHERE",
         update=_on_shape_change)
@@ -1939,11 +1985,23 @@ def _aim(obj, target=(0.0, 0.0, 0.0)):
     obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
 
 
-def _frame_object(scene, cam, mesh, fill=0.8):
+def _mesh_points(mesh, matrix=None, max_points=4000):
+    """Vertex positions (world space if `matrix` given), thinned out for big meshes."""
+    n = len(mesh.vertices)
+    co = np.empty(n * 3, np.float32)
+    mesh.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3)[::max(1, n // max_points)]
+    if matrix is not None:
+        m = np.array(matrix, np.float64)
+        co = co @ m[:3, :3].T + m[:3, 3]
+    return co
+
+
+def _frame_object(scene, cam, mesh, fill=0.8, matrix=None):
     """Zoom and shift the camera so the shape's on-screen outline is centred
     and fills the same fraction of the frame, whatever the shape."""
     cam.matrix_world = Matrix.Translation(cam.location) @ cam.rotation_euler.to_matrix().to_4x4()
-    pts = [world_to_camera_view(scene, cam, v.co) for v in mesh.vertices]
+    pts = [world_to_camera_view(scene, cam, Vector(c)) for c in _mesh_points(mesh, matrix)]
     if not pts:
         return
     xs = [pt.x for pt in pts]
@@ -1996,10 +2054,39 @@ def maps_grid_png(arrays, size=512):
     return path
 
 
+def _metres(m):
+    return "%.0f cm" % (m * 100) if m < 1 else "%.3g m" % m
+
+
+def selected_object_mesh():
+    """Copy of the active object's final shape (modifiers applied, UVs kept),
+    plus its rotation/scale. Raises a friendly error if nothing usable is selected."""
+    obj = bpy.context.view_layer.objects.active
+    if obj is None:
+        raise RuntimeError("Select an object to preview the texture on")
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    try:
+        mesh = bpy.data.meshes.new_from_object(obj.evaluated_get(depsgraph),
+                                               preserve_all_data_layers=True, depsgraph=depsgraph)
+    except RuntimeError:
+        raise RuntimeError("'%s' is a %s, which has no surface to show a texture on"
+                           % (obj.name, obj.type.lower())) from None
+    if len(mesh.polygons) == 0:
+        bpy.data.meshes.remove(mesh)
+        raise RuntimeError("'%s' has no faces to show a texture on" % obj.name)
+    mesh.name = "PBRGenPreview_Mesh"
+    mesh.materials.clear()
+    mesh.polygons.foreach_set("material_index", np.zeros(len(mesh.polygons), np.int32))
+    _loc, rot, scale = obj.matrix_world.decompose()
+    return mesh, Matrix.LocRotScale(None, rot, scale), obj.name
+
+
 def render_preview(arrays, p, size=512):
     """Render the maps on the chosen shape in a temporary scene; returns PNG path."""
     if p.preview_view == "MAPS":
         return maps_grid_png(arrays, size)
+    # Build the selected object's copy first, so a bad selection fails before any setup.
+    selected = selected_object_mesh() if p.preview_shape == "SELECTED" else None
     made = {"images": [], "objects": [], "data": []}
     maps = make_images("PBRGenPreview", arrays, keep=False)
     made["images"] = list(maps.values())
@@ -2049,23 +2136,42 @@ def render_preview(arrays, p, size=512):
             made["data"].append(data)
             return obj
 
-        mesh = make_shape_mesh(p.preview_shape)
+        if selected is not None:
+            mesh, obj_matrix, _name = selected
+        else:
+            mesh, obj_matrix = make_shape_mesh(p.preview_shape), None
         mesh.materials.append(mat)
         shape_obj = add("PBRGenPreview_Obj", mesh, (0, 0, 0))
+        if obj_matrix is not None:
+            shape_obj.matrix_basis = obj_matrix  # same rotation & scale as in the scene
         if p.preview_shape == "MONKEY":
             mod = shape_obj.modifiers.new("Subdivision", "SUBSURF")
             mod.levels = mod.render_levels = 2
 
+        # The built-in shapes are all about 3 m across, centred on the origin.
+        # A selected object can be any size, anywhere, so scale the whole
+        # camera + light rig around it (k = 1 for the built-in shapes).
+        center, k = Vector((0.0, 0.0, 0.0)), 1.0
+        if obj_matrix is not None:
+            pts = _mesh_points(mesh, obj_matrix)
+            lo, hi = pts.min(axis=0), pts.max(axis=0)
+            center = Vector(((lo + hi) / 2).tolist())
+            radius = float(np.linalg.norm(pts - np.array(center), axis=1).max())
+            k = max(radius, 1e-4) / 1.6
+
         cam_data = bpy.data.cameras.new("PBRGenPreview_Cam")
         cam_data.lens = 50
+        cam_data.clip_start = 0.01 * k
+        cam_data.clip_end = 100.0 * k
         cam_loc = (0.0, -3.0, 3.9) if p.preview_shape == "PLANE" else (2.5, -3.75, 2.05)
         if p.preview_shape == "MONKEY":
             cam_loc = (1.4, -4.4, 1.25)
-        cam = add("PBRGenPreview_Cam", cam_data, cam_loc)
-        _aim(cam)
+        cam = add("PBRGenPreview_Cam", cam_data, center + Vector(cam_loc) * k)
+        _aim(cam, center)
         scene.camera = cam
         # Close-up zooms in until the surface fills the frame, so detail is easy to judge.
-        _frame_object(scene, cam, mesh, fill=1.9 if p.preview_view == "CLOSEUP" else 0.8)
+        _frame_object(scene, cam, mesh, fill=1.9 if p.preview_view == "CLOSEUP" else 0.8,
+                      matrix=obj_matrix)
 
         # Lighting chosen to make setting changes visible:
         #  - a small, low side light rakes across the surface so bumps cast shadows
@@ -2080,9 +2186,9 @@ def render_preview(arrays, p, size=512):
                                       ("ReflectFront", 220, (-3.0, -4.5, -2.4), 1.0),
                                       ("ReflectSide", 220, (4.5, 3.0, -2.4), 1.0)):
             ld = bpy.data.lights.new("PBRGenPreview_" + name, "AREA")
-            ld.energy = energy
-            ld.size = sz
-            _aim(add("PBRGenPreview_" + name, ld, loc))
+            ld.energy = energy * k * k  # light falls off with distance squared
+            ld.size = sz * k
+            _aim(add("PBRGenPreview_" + name, ld, center + Vector(loc) * k), center)
 
         bpy.ops.render.render(write_still=False, scene=scene.name)
         result = bpy.data.images.get("Render Result")
@@ -2411,7 +2517,20 @@ class PBRGEN_PT_preview(PBRGEN_PT_base, bpy.types.Panel):
 
         row = layout.row(align=True)
         row.prop(p, "preview_shape", expand=True, icon_only=True)
-        layout.label(text="Shape: " + p.bl_rna.properties["preview_shape"].enum_items[p.preview_shape].name)
+        if p.preview_shape == "SELECTED":
+            obj = context.view_layer.objects.active
+            if obj is None:
+                layout.label(text="Shape: Selected Object (nothing selected)", icon="ERROR")
+            else:
+                layout.label(text="Shape: Selected Object (%s)" % obj.name)
+                if (p.projection == "UV" and obj.type == "MESH" and not obj.data.uv_layers):
+                    layout.label(text="This object has no UV map: use Box", icon="ERROR")
+                elif p.projection == "BOX":
+                    # Real-world size of one repeat, so tiny/huge objects make sense
+                    layout.label(text="Pattern size: %s (see Tiling)" % _metres(2.0 / p.tiling),
+                                 icon="INFO")
+        else:
+            layout.label(text="Shape: " + p.bl_rna.properties["preview_shape"].enum_items[p.preview_shape].name)
         layout.row().prop(p, "projection", expand=True)
         row = layout.row(align=True)
         row.operator("pbrgen.preview", icon="FILE_REFRESH")
@@ -2538,10 +2657,18 @@ def register():
     if not bpy.app.background:
         _draw_state["handle"] = bpy.types.SpaceView3D.draw_handler_add(
             _draw_viewport_preview, (), "WINDOW", "POST_PIXEL")
+    _subscribe_selection()
+    bpy.app.handlers.load_post.append(_on_file_loaded)
+    bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
 
 
 def unregister():
     import bpy.utils.previews
+    bpy.msgbus.clear_by_owner(_MSGBUS_OWNER)
+    for handlers, fn in ((bpy.app.handlers.load_post, _on_file_loaded),
+                         (bpy.app.handlers.depsgraph_update_post, _on_depsgraph_update)):
+        if fn in handlers:
+            handlers.remove(fn)
     if _draw_state["handle"] is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_draw_state["handle"], "WINDOW")
         _draw_state["handle"] = None
