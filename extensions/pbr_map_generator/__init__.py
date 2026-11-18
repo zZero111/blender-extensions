@@ -20,7 +20,7 @@ Find it in the 3D Viewport sidebar (N key) under the "PBR Maps" tab.
 bl_info = {  # only used by the old add-on system; blender_manifest.toml is what counts
     "name": "PBR Map Generator",
     "author": "PBR Map Generator",
-    "version": (1, 11, 0),
+    "version": (1, 12, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > PBR Maps",
     "description": "Generate normal, bump, roughness and AO maps from images, plus procedural textures",
@@ -2877,6 +2877,58 @@ class PBRGEN_Props(bpy.types.PropertyGroup):
     ph_pick: EnumProperty(name="Texture", items=_dyn_items("_ph_items"),
                           description="The Poly Haven texture to download")
 
+    # --- baking
+    bake_maps: EnumProperty(
+        name="Maps", description="Which maps to bake",
+        items=[("BASE_COLOR", "Base Color", "The material's final color (with its AO, wear and dirt)"),
+               ("ROUGHNESS", "Roughness", "How shiny or matte each spot is"),
+               ("METALLIC", "Metallic", "Which parts are metal"),
+               ("NORMAL", "Normal", "The bumps as a tangent-space normal map (from the material, "
+                                    "or from a high-poly object if you pick one)"),
+               ("HEIGHT", "Height", "The material's height map, for parallax or displacement in other apps"),
+               ("AO", "Model AO", "Shadowing in the model's own corners and creases"),
+               ("EDGES", "Model Edges", "White along the model's sharp edges (curvature), for wear in other tools"),
+               ("THICKNESS", "Thickness", "Bright where the model is thin, for subsurface/translucency")],
+        options={"ENUM_FLAG"}, default={"BASE_COLOR", "ROUGHNESS", "NORMAL", "AO"})
+    bake_res: EnumProperty(
+        name="Size", description="Size of the baked textures",
+        items=[("512", "512", ""), ("1024", "1K", ""), ("2048", "2K", ""), ("4096", "4K", "")],
+        default="2048")
+    bake_uv: EnumProperty(
+        name="UVs", description="Which UV map to bake into",
+        items=[("AUTO", "Auto", "Use the object's UV map, or make one with Smart UV Project if it has none"),
+               ("EXISTING", "Existing", "Always use the object's current UV map"),
+               ("NEW", "New", "Always make a fresh non-overlapping UV map (added as 'PBR Bake'; yours are kept)")],
+        default="AUTO")
+    bake_atlas: BoolProperty(
+        name="One Shared Texture (Atlas)", default=False,
+        description="Bake all selected objects into one set of textures, packing their UVs together. "
+                    "Good for game props that should share one material")
+    bake_margin: IntProperty(
+        name="Margin", default=16, min=0, max=64, subtype="PIXEL",
+        description="How far colors spread past UV island edges, so no seams show when the texture is shrunk")
+    bake_samples: IntProperty(
+        name="AO Quality", default=32, min=4, max=512,
+        description="Samples for the Model AO, Edges and Thickness maps. Higher = smoother but slower")
+    bake_high_poly: PointerProperty(
+        name="High-Poly", type=bpy.types.Object, poll=lambda self, obj: obj.type == "MESH",
+        description="Optional detailed version of the model: its detail is baked into the selected (low-poly) "
+                    "object's Normal map. The Height to Geometry result works well here")
+    bake_extrusion: FloatProperty(
+        name="Ray Distance", default=0.05, min=0.0, soft_max=1.0, unit="LENGTH",
+        description="How far out from the low-poly surface to look for the high-poly surface. "
+                    "Raise it if parts of the normal map come out blank")
+    bake_make_material: BoolProperty(
+        name="Use Baked Material", default=True,
+        description="Put a new simple material using the baked textures on the objects, "
+                    "so you see exactly what a game engine will show")
+    vc_include_ao: BoolProperty(
+        name="Include AO", default=True,
+        description="Darken the vertex colors in the model's corners and creases")
+    vc_make_material: BoolProperty(
+        name="Use Vertex Color Material", default=True,
+        description="Put a simple material that shows the vertex colors on the objects")
+
 
 # ---------------------------------------------------------------------------
 # Map generation (arrays only, no Blender data)
@@ -4779,6 +4831,557 @@ class PBRGEN_OT_ph_download(_ExistingChoice, bpy.types.Operator):
         return self.start_job(context, "%s (%s)" % (_ph["assets"][aid].get("name", aid), res), work, done)
 
 
+# ---------------------------------------------------------------------------
+# Baking (Cycles): material -> UV textures, model maps, high -> low normals,
+# vertex colors, several objects / shared atlas
+# ---------------------------------------------------------------------------
+
+BAKE_MAPS = (
+    # key, label, file suffix, colorspace, how it's baked
+    ("BASE_COLOR", "Base Color", "_BaseColor", "sRGB", "DIFFUSE"),
+    ("ROUGHNESS", "Roughness", "_Roughness", "Non-Color", "ROUGHNESS"),
+    ("METALLIC", "Metallic", "_Metallic", "Non-Color", "EMIT"),
+    ("NORMAL", "Normal", "_Normal", "Non-Color", "NORMAL"),
+    ("HEIGHT", "Height", "_Height", "Non-Color", "EMIT"),
+    ("AO", "Model AO", "_AO", "Non-Color", "AO"),
+    ("EDGES", "Model Edges", "_Edges", "Non-Color", "EMIT"),
+    ("THICKNESS", "Thickness", "_Thickness", "Non-Color", "EMIT"),
+)
+BAKE_UV_NAME = "PBR Bake"
+
+
+def _bake_size(objs):
+    """A typical size of the objects (for AO / edge distances), in meters."""
+    dims = [max(o.dimensions) for o in objs if max(o.dimensions) > 0]
+    return max(1e-3, sum(dims) / len(dims)) if dims else 1.0
+
+
+class _MaterialPatch:
+    """Temporarily rewires materials for one bake pass and puts everything back."""
+
+    def __init__(self, mats):
+        self.mats = [m for m in mats if m is not None and m.node_tree]
+        self.undo = []
+
+    def _out(self, mat):
+        return next((n for n in mat.node_tree.nodes
+                     if n.bl_idname == "ShaderNodeOutputMaterial" and n.is_active_output),
+                    next((n for n in mat.node_tree.nodes if n.bl_idname == "ShaderNodeOutputMaterial"), None))
+
+    def _new(self, mat, idname):
+        n = mat.node_tree.nodes.new(idname)
+        n.location = (-2000, -2000)
+        self.undo.append(("node", mat, n))
+        return n
+
+    def _unlink(self, mat, sock):
+        for link in list(sock.links):
+            self.undo.append(("link", mat, link.from_socket, sock))
+            mat.node_tree.links.remove(link)
+
+    def no_displacement(self):
+        """True displacement would move the surface while baking; switch it off."""
+        for mat in self.mats:
+            out = self._out(mat)
+            if out is not None:
+                self._unlink(mat, out.inputs["Displacement"])
+
+    def no_metal(self):
+        """Metal has no diffuse color, so bake the color as if it weren't metal."""
+        for mat in self.mats:
+            for n in mat.node_tree.nodes:
+                if n.bl_idname == "ShaderNodeBsdfPrincipled":
+                    sock = n.inputs["Metallic"]
+                    self._unlink(mat, sock)
+                    self.undo.append(("value", sock, sock.default_value))
+                    sock.default_value = 0.0
+
+    def emit(self, source):
+        """Show `source(mat, nodes)` (a socket or a number, or None to skip) as pure emission."""
+        for mat in self.mats:
+            out = self._out(mat)
+            if out is None:
+                continue
+            value = source(mat)
+            em = self._new(mat, "ShaderNodeEmission")
+            em.inputs["Strength"].default_value = 1.0
+            if isinstance(value, bpy.types.NodeSocket):
+                mat.node_tree.links.new(value, em.inputs["Color"])
+            else:
+                v = 0.0 if value is None else float(value)
+                em.inputs["Color"].default_value = (v, v, v, 1.0)
+            self._unlink(mat, out.inputs["Surface"])
+            mat.node_tree.links.new(em.outputs["Emission"], out.inputs["Surface"])
+
+    def restore(self):
+        for item in reversed(self.undo):
+            kind = item[0]
+            try:
+                if kind == "node":
+                    item[1].node_tree.nodes.remove(item[2])
+                elif kind == "link":
+                    item[1].node_tree.links.new(item[2], item[3])
+                elif kind == "value":
+                    item[1].default_value = item[2]
+            except (ReferenceError, RuntimeError):
+                pass
+        self.undo = []
+
+
+def _metallic_source(mat):
+    for n in mat.node_tree.nodes:
+        if n.bl_idname == "ShaderNodeBsdfPrincipled":
+            s = n.inputs["Metallic"]
+            return s.links[0].from_socket if s.is_linked else s.default_value
+    return 0.0
+
+
+def _height_source(mat):
+    for n in mat.node_tree.nodes:
+        if n.bl_idname == "ShaderNodeDisplacement" and n.inputs["Height"].is_linked:
+            return n.inputs["Height"].links[0].from_socket
+    for n in mat.node_tree.nodes:
+        if n.bl_idname == "ShaderNodeBump" and n.inputs["Height"].is_linked:
+            return n.inputs["Height"].links[0].from_socket
+    return 0.5
+
+
+def _edges_source_factory(patch, radius):
+    def source(mat):
+        # Rounded-corner normal vs real normal: they differ only near sharp edges.
+        geo = patch._new(mat, "ShaderNodeNewGeometry")
+        bev = patch._new(mat, "ShaderNodeBevel")
+        bev.samples = 8
+        bev.inputs["Radius"].default_value = radius
+        dot = patch._new(mat, "ShaderNodeVectorMath")
+        dot.operation = "DOT_PRODUCT"
+        mat.node_tree.links.new(geo.outputs["Normal"], dot.inputs[0])
+        mat.node_tree.links.new(bev.outputs["Normal"], dot.inputs[1])
+        rng = patch._new(mat, "ShaderNodeMapRange")
+        rng.inputs["From Min"].default_value = 1.0
+        rng.inputs["From Max"].default_value = 0.85
+        mat.node_tree.links.new(dot.outputs["Value"], rng.inputs["Value"])
+        return rng.outputs["Result"]
+    return source
+
+
+def _thickness_source_factory(patch, distance):
+    def source(mat):
+        ao = patch._new(mat, "ShaderNodeAmbientOcclusion")
+        ao.inside = True
+        ao.samples = 16
+        ao.inputs["Distance"].default_value = distance
+        return ao.outputs["AO"]  # bright = thin (light passes through easily)
+    return source
+
+
+class _BakeScene:
+    """Switch the scene to Cycles bake settings and back."""
+
+    def __init__(self, scene):
+        self.scene = scene
+        r, c = scene.render, scene.cycles
+        self.saved = (r.engine, c.samples, getattr(c, "use_denoising", False), r.bake.margin,
+                      r.bake.use_clear, r.bake.use_selected_to_active, r.bake.cage_extrusion,
+                      r.bake.max_ray_distance, r.bake.normal_g, r.bake.target)
+        r.engine = "CYCLES"
+
+    def set(self, samples, margin, clear=True, selected_to_active=False, extrusion=0.0, directx=False,
+            target="IMAGE_TEXTURES"):
+        r, c = self.scene.render, self.scene.cycles
+        c.samples = samples
+        if hasattr(c, "use_denoising"):
+            c.use_denoising = False
+        r.bake.margin = margin
+        r.bake.use_clear = clear
+        r.bake.use_selected_to_active = selected_to_active
+        r.bake.cage_extrusion = extrusion
+        r.bake.max_ray_distance = extrusion * 4 if selected_to_active else 0.0
+        r.bake.normal_g = "NEG_Y" if directx else "POS_Y"
+        r.bake.target = target
+
+    def restore(self):
+        r, c = self.scene.render, self.scene.cycles
+        (r.engine, c.samples, den, r.bake.margin, r.bake.use_clear, r.bake.use_selected_to_active,
+         r.bake.cage_extrusion, r.bake.max_ray_distance, r.bake.normal_g, r.bake.target) = self.saved
+        if hasattr(c, "use_denoising"):
+            c.use_denoising = den
+
+
+def _object_mode(context):
+    if context.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def prepare_bake_uvs(context, objs, mode, atlas, margin_px, res):
+    """Make sure every object has a sensible UV map to bake into. Returns the UV map
+    names used. New maps are added (never overwriting your own) and unwrapped with
+    Smart UV Project; in atlas mode all objects are packed into one shared layout."""
+    names = {}
+    need = []
+    for o in objs:
+        uvs = o.data.uv_layers
+        if atlas or mode == "NEW" or (mode == "AUTO" and len(uvs) == 0):
+            layer = uvs.get(BAKE_UV_NAME) or uvs.new(name=BAKE_UV_NAME)
+            need.append(o)
+        else:
+            layer = uvs.active
+        uvs.active = layer
+        layer.active_render = True
+        names[o.name] = layer.name
+    if need:
+        view_layer = context.view_layer
+        prev_active = view_layer.objects.active
+        prev_sel = [o for o in context.selected_objects]
+        for o in context.selected_objects:
+            o.select_set(False)
+        for o in need:
+            o.select_set(True)
+        view_layer.objects.active = need[0]
+        # Multi-object Edit Mode: Smart UV Project packs every object into one 0..1 space.
+        groups = [need] if atlas else [[o] for o in need]
+        for group in groups:
+            for o in need:
+                o.select_set(o in group)
+            view_layer.objects.active = group[0]
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.mesh.select_all(action="SELECT")
+            bpy.ops.uv.smart_project(angle_limit=math.radians(66), island_margin=max(0.002, 2.0 * margin_px / res))
+            bpy.ops.object.mode_set(mode="OBJECT")
+        for o in need:
+            o.select_set(False)
+        for o in prev_sel:
+            o.select_set(True)
+        view_layer.objects.active = prev_active
+    return names
+
+
+def bake_objects(context, objs, keys, res, margin, samples, atlas, high=None, extrusion=0.05,
+                 directx=False, uv_mode="AUTO", report=None):
+    """Bake the chosen maps for these objects. Returns {object name: {key: Image}}
+    (in atlas mode every object shares the same images)."""
+    _object_mode(context)
+    prepare_bake_uvs(context, objs, uv_mode, atlas, margin, res)
+    scene = context.scene
+    view_layer = context.view_layer
+    size = _bake_size(objs)
+    prev_active = view_layer.objects.active
+    prev_sel = list(context.selected_objects)
+    bake_scene = _BakeScene(scene)
+    results = {o.name: {} for o in objs}
+    try:
+        for key, label, suffix, colorspace, how in BAKE_MAPS:
+            if key not in keys:
+                continue
+            groups = [objs] if atlas else [[o] for o in objs]
+            for group in groups:
+                base = "Atlas" if atlas else group[0].name
+                img = bpy.data.images.new("%s%s_Baked" % (bpy.path.clean_name(base), suffix), res, res,
+                                          alpha=False, float_buffer=False)
+                img.colorspace_settings.name = colorspace
+                mats = {s.material for o in group for s in o.material_slots if s.material is not None}
+                if not mats:
+                    for o in group:  # bake still needs a material to hold the target image
+                        m = bpy.data.materials.new(o.name + "_BakeTarget")
+                        m.use_nodes = True
+                        o.data.materials.append(m)
+                        mats.add(m)
+                patch = _MaterialPatch(mats)
+                try:
+                    patch.no_displacement()
+                    # The image the bake writes into: the selected, active Image node.
+                    for m in patch.mats:
+                        tgt = patch._new(m, "ShaderNodeTexImage")
+                        tgt.image = img
+                        for n in m.node_tree.nodes:
+                            n.select = False
+                        tgt.select = True
+                        m.node_tree.nodes.active = tgt
+                    use_high = key == "NORMAL" and high is not None
+                    bake_type, pass_filter, n_samples = how, set(), 4
+                    if how == "DIFFUSE":
+                        patch.no_metal()
+                        pass_filter = {"COLOR"}
+                    elif key == "METALLIC":
+                        patch.emit(_metallic_source)
+                    elif key == "HEIGHT":
+                        patch.emit(_height_source)
+                    elif key == "EDGES":
+                        patch.emit(_edges_source_factory(patch, 0.02 * size))
+                        n_samples = samples
+                    elif key == "THICKNESS":
+                        patch.emit(_thickness_source_factory(patch, 0.5 * size))
+                        n_samples = samples
+                    elif key == "AO":
+                        n_samples = samples
+                    bake_scene.set(n_samples, margin, clear=True, selected_to_active=use_high,
+                                   extrusion=extrusion, directx=directx)
+                    for o in context.selected_objects:
+                        o.select_set(False)
+                    for o in group:
+                        o.select_set(True)
+                    if use_high:
+                        high.select_set(True)
+                    view_layer.objects.active = group[0]
+                    kwargs = {"type": bake_type, "margin": margin, "use_clear": True}
+                    if pass_filter:
+                        kwargs["pass_filter"] = pass_filter
+                    if use_high:
+                        kwargs.update(use_selected_to_active=True, cage_extrusion=extrusion)
+                    bpy.ops.object.bake(**kwargs)
+                finally:
+                    patch.restore()
+                for o in group:
+                    results[o.name][key] = img
+                if report:
+                    report("baked %s for %s" % (label, base))
+    finally:
+        bake_scene.restore()
+        for o in context.selected_objects:
+            o.select_set(False)
+        for o in prev_sel:
+            try:
+                o.select_set(True)
+            except ReferenceError:
+                pass
+        view_layer.objects.active = prev_active
+    return results
+
+
+def baked_arrays(images):
+    """Baked images -> the arrays the rest of the add-on uses (for engine packing)."""
+    def grey(img):
+        return image_to_array(img)[..., 0].astype(np.float32)
+    out = {}
+    if "ROUGHNESS" in images:
+        out["roughness"] = grey(images["ROUGHNESS"])
+    if "METALLIC" in images:
+        out["metallic"] = grey(images["METALLIC"])
+    if "AO" in images:
+        out["ao"] = grey(images["AO"])
+    if out and "ao" not in out:
+        out["ao"] = np.ones_like(next(iter(out.values())))
+    return out
+
+
+def baked_material(name, images, props):
+    """A plain UV material that uses the baked maps (what a game engine would show)."""
+    def flat(value, ref):
+        img = bpy.data.images.new(name + "_Flat%d" % int(value * 100), 4, 4)
+        img.pixels.foreach_set(np.full(64, value, np.float32))
+        img.pack()
+        img.colorspace_settings.name = "Non-Color"
+        return img
+    ref = next(iter(images.values()))
+    maps = {
+        "albedo": images.get("BASE_COLOR") or flat(0.8, ref),
+        "roughness": images.get("ROUGHNESS") or flat(0.5, ref),
+        "normal": images.get("NORMAL") or flat(0.5, ref),
+        "height": images.get("HEIGHT") or flat(0.5, ref),
+        "ao": images.get("AO") or flat(1.0, ref),
+    }
+    if "NORMAL" not in images:
+        maps["normal"].pixels.foreach_set(np.tile(np.array([0.5, 0.5, 1.0, 1.0], np.float32), 16))
+    if "METALLIC" in images:
+        maps["metallic"] = images["METALLIC"]
+    plain = SimpleNamespace(**{k: getattr(props, k) for k in (
+        "ao_mix", "normal_strength", "box_blend", "displacement_scale", "use_displacement")})
+    plain.tiling, plain.projection, plain.anti_tiling = 1.0, "UV", False
+    plain.object_edge_wear = plain.object_dirt = 0.0
+    mat = build_material(name, maps, plain, 1.0, (1.0, 1.0, 1.0), "UV")
+    if "AO" not in images:
+        mix = next((n for n in mat.node_tree.nodes if n.label == "AO Multiply"), None)
+        if mix is not None:
+            mix.inputs[0].default_value = 0.0
+    if "NORMAL" in images:
+        # The baked normal map already holds the bumps: use it, not the height.
+        nt = mat.node_tree
+        bsdf = next(n for n in nt.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled")
+        nimg = next(n for n in nt.nodes if n.bl_idname == "ShaderNodeTexImage" and n.label == "Normal")
+        nmap = next((n for n in nt.nodes if n.bl_idname == "ShaderNodeNormalMap"), None)
+        if nmap is None:
+            nmap = nt.nodes.new("ShaderNodeNormalMap")
+            nmap.location = (500, -400)
+        for l in list(bsdf.inputs["Normal"].links):
+            nt.links.remove(l)
+        nt.links.new(nimg.outputs["Color"], nmap.inputs["Color"])
+        nt.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
+    return mat
+
+
+def save_baked(images, out_dir):
+    """Save baked images to the folder as PNG, or pack them into the .blend."""
+    folder = bpy.path.abspath(out_dir) if out_dir else ""
+    for img in images:
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+            img.filepath_raw = os.path.join(folder, bpy.path.clean_name(img.name) + ".png")
+            img.file_format = "PNG"
+            img.save()
+        else:
+            img.pack()
+
+
+class PBRGEN_OT_bake(bpy.types.Operator):
+    """Bake the selected objects' materials (and model maps) into plain UV textures: \
+what you need for game engines and other apps, which can't use Blender's node tricks \
+like Box projection, Hide Repeats or model wear. Uses Cycles; Blender is busy until it finishes"""
+    bl_idname = "pbrgen.bake"
+    bl_label = "Bake Textures"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        p = context.scene.pbrgen
+        objs = [o for o in context.selected_objects if o.type == "MESH"]
+        if not objs and context.active_object is not None and context.active_object.type == "MESH":
+            objs = [context.active_object]
+        high = p.bake_high_poly
+        objs = [o for o in objs if o != high]
+        keys = set(p.bake_maps)
+        if not objs:
+            self.report({"ERROR"}, "Select the mesh objects to bake")
+            return {"CANCELLED"}
+        if not keys:
+            self.report({"ERROR"}, "Choose at least one map to bake")
+            return {"CANCELLED"}
+        if high is not None and (len(objs) > 1 or p.bake_atlas):
+            self.report({"ERROR"}, "Baking from a high-poly object works with one low-poly object at a time")
+            return {"CANCELLED"}
+        res = int(p.bake_res)
+        t0 = time.time()
+
+        def status(text):
+            try:
+                context.workspace.status_text_set("PBR Maps: " + text)
+            except Exception:  # noqa: BLE001
+                pass
+            print("PBR Map Generator:", text)
+
+        try:
+            results = bake_objects(context, objs, keys, res, p.bake_margin, p.bake_samples, p.bake_atlas,
+                                   high=high, extrusion=p.bake_extrusion, directx=p.directx_normal,
+                                   uv_mode=p.bake_uv, report=status)
+        except Exception as e:  # noqa: BLE001
+            self.report({"ERROR"}, "Bake failed: %s" % e)
+            return {"CANCELLED"}
+        finally:
+            try:
+                context.workspace.status_text_set(None)
+            except Exception:  # noqa: BLE001
+                pass
+
+        done_images = {}
+        for oname, imgs in results.items():
+            for img in imgs.values():
+                done_images[img.name] = img
+        packed_extra = []
+        groups = {"Atlas": objs} if p.bake_atlas else {o.name: [o] for o in objs}
+        for base, group in groups.items():
+            imgs = results[group[0].name]
+            if p.pack_maps != "NONE":
+                arrays = baked_arrays(imgs)
+                if "roughness" in arrays:
+                    extra = add_engine_maps(arrays, p.pack_maps)
+                    for key, sfx, _nc in _MAP_SPEC:
+                        if key in extra and key in ("orm", "metal_smooth", "mask_map"):
+                            packed_extra.append(array_to_image(bpy.path.clean_name(base) + sfx + "_Baked",
+                                                               extra[key], True, keep=False))
+            if p.bake_make_material:
+                mat = baked_material(bpy.path.clean_name(base) + "_Baked", imgs, p)
+                for o in group:
+                    o.data.materials.clear()
+                    o.data.materials.append(mat)
+        save_baked(list(done_images.values()) + packed_extra, p.out_dir)
+        where = "saved to the Save Folder" if p.out_dir else "packed in the .blend"
+        self.report({"INFO"}, "Baked %d map%s for %d object%s in %.0fs (%s)%s" % (
+            len(keys), "" if len(keys) == 1 else "s", len(objs), "" if len(objs) == 1 else "s",
+            time.time() - t0, where, ", baked materials assigned" if p.bake_make_material else ""))
+        return {"FINISHED"}
+
+
+VC_ATTR = "PBR Baked Color"
+
+
+class PBRGEN_OT_bake_vertex_colors(bpy.types.Operator):
+    """Bake the selected objects' color (optionally darkened by the model's ambient occlusion) \
+into their vertices, for very light scenes or mobile games that use no textures. \
+Needs enough vertices to hold the detail"""
+    bl_idname = "pbrgen.bake_vertex_colors"
+    bl_label = "Bake to Vertex Colors"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        p = context.scene.pbrgen
+        objs = [o for o in context.selected_objects if o.type == "MESH"]
+        if not objs:
+            self.report({"ERROR"}, "Select the mesh objects to bake")
+            return {"CANCELLED"}
+        _object_mode(context)
+        scene, view_layer = context.scene, context.view_layer
+        prev_active, prev_sel = view_layer.objects.active, list(context.selected_objects)
+        bake_scene = _BakeScene(scene)
+        try:
+            for o in objs:
+                attrs = o.data.color_attributes
+                passes = [("COLOR", VC_ATTR)] + ([("AO", VC_ATTR + " AO")] if p.vc_include_ao else [])
+                for kind, name in passes:
+                    ca = attrs.get(name) or attrs.new(name, "BYTE_COLOR", "CORNER")
+                    attrs.active_color = ca
+                    patch = _MaterialPatch({s.material for s in o.material_slots})
+                    try:
+                        patch.no_displacement()
+                        kwargs = {"target": "VERTEX_COLORS", "use_clear": True}
+                        if kind == "COLOR":
+                            patch.no_metal()
+                            kwargs.update(type="DIFFUSE", pass_filter={"COLOR"})
+                            bake_scene.set(4, 0, target="VERTEX_COLORS")
+                        else:
+                            kwargs.update(type="AO")
+                            bake_scene.set(p.bake_samples, 0, target="VERTEX_COLORS")
+                        for x in context.selected_objects:
+                            x.select_set(False)
+                        o.select_set(True)
+                        view_layer.objects.active = o
+                        bpy.ops.object.bake(**kwargs)
+                    finally:
+                        patch.restore()
+                if p.vc_include_ao:
+                    col = np.empty(len(attrs[VC_ATTR].data) * 4, np.float32)
+                    ao = np.empty_like(col)
+                    attrs[VC_ATTR].data.foreach_get("color", col)
+                    attrs[VC_ATTR + " AO"].data.foreach_get("color", ao)
+                    col = col.reshape(-1, 4)
+                    col[:, :3] *= ao.reshape(-1, 4)[:, :1]
+                    attrs[VC_ATTR].data.foreach_set("color", col.ravel())
+                    attrs.remove(attrs[VC_ATTR + " AO"])
+                attrs.active_color = attrs[VC_ATTR]
+                attrs.render_color_index = attrs.find(VC_ATTR)
+                if p.vc_make_material:
+                    mat = bpy.data.materials.new(o.name + "_VertexColor")
+                    mat.use_nodes = True
+                    nt = mat.node_tree
+                    bsdf = next(n for n in nt.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled")
+                    vc = nt.nodes.new("ShaderNodeVertexColor")
+                    vc.layer_name = VC_ATTR
+                    vc.location = (-300, 300)
+                    nt.links.new(vc.outputs["Color"], bsdf.inputs["Base Color"])
+                    bsdf.inputs["Roughness"].default_value = 0.8
+                    o.data.materials.clear()
+                    o.data.materials.append(mat)
+        except Exception as e:  # noqa: BLE001
+            self.report({"ERROR"}, "Bake failed: %s" % e)
+            return {"CANCELLED"}
+        finally:
+            bake_scene.restore()
+            for x in context.selected_objects:
+                x.select_set(False)
+            for x in prev_sel:
+                x.select_set(True)
+            view_layer.objects.active = prev_active
+        self.report({"INFO"}, "Baked vertex colors on %d object%s" % (len(objs), "" if len(objs) == 1 else "s"))
+        return {"FINISHED"}
+
+
 class PBRGEN_OT_preview(bpy.types.Operator):
     """Render a quick preview of the material on the chosen shape. \
 Nothing is added to your scene"""
@@ -5305,6 +5908,44 @@ class PBRGEN_PT_polyhaven(PBRGEN_PT_base, bpy.types.Panel):
         layout.label(text="Free CC0 textures from polyhaven.com", icon="URL")
 
 
+class PBRGEN_PT_bake(PBRGEN_PT_base, bpy.types.Panel):
+    bl_label = "Bake"
+    bl_idname = "PBRGEN_PT_bake"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon="RENDER_STILL")
+
+    def draw(self, context):
+        p = context.scene.pbrgen
+        sync_viewport_overlay(context)
+        layout = self.layout
+        sel = [o for o in context.selected_objects if o.type == "MESH" and o != p.bake_high_poly]
+        layout.label(text="%d object%s selected" % (len(sel), "" if len(sel) == 1 else "s"), icon="OBJECT_DATA")
+        grid = layout.grid_flow(columns=2, even_columns=True, align=True)
+        grid.prop(p, "bake_maps", expand=True)
+        row = layout.row(align=True)
+        row.prop(p, "bake_res", expand=True)
+        layout.row().prop(p, "bake_uv", expand=True)
+        col = layout.column(align=True)
+        col.prop(p, "bake_margin")
+        col.prop(p, "bake_samples")
+        layout.prop(p, "bake_atlas")
+        box = layout.box()
+        box.prop(p, "bake_high_poly")
+        if p.bake_high_poly is not None:
+            box.prop(p, "bake_extrusion")
+        layout.prop(p, "bake_make_material")
+        layout.label(text="Saved to Save Folder, or packed" if not p.out_dir else "Saved to the Save Folder",
+                     icon="INFO")
+        layout.operator("pbrgen.bake", icon="RENDER_STILL")
+        layout.separator()
+        row = layout.row(align=True)
+        row.prop(p, "vc_include_ao")
+        row.prop(p, "vc_make_material", text="Use Material")
+        layout.operator("pbrgen.bake_vertex_colors", icon="VPAINT_HLT")
+
+
 class PBRGEN_PT_output(PBRGEN_PT_base, bpy.types.Panel):
     bl_label = "Output Settings"
     bl_idname = "PBRGEN_PT_output"
@@ -5378,6 +6019,8 @@ classes = (
     PBRGEN_OT_trim_assign,
     PBRGEN_OT_ph_search,
     PBRGEN_OT_ph_download,
+    PBRGEN_OT_bake,
+    PBRGEN_OT_bake_vertex_colors,
     PBRGEN_MT_tex_presets,
     PBRGEN_OT_add_tex_preset,
     PBRGEN_OT_preview,
@@ -5392,6 +6035,7 @@ classes = (
     PBRGEN_PT_trim,
     PBRGEN_PT_blend,
     PBRGEN_PT_polyhaven,
+    PBRGEN_PT_bake,
     PBRGEN_PT_output,
 )
 
