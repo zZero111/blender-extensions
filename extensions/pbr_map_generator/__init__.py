@@ -16,7 +16,7 @@ Find it in the 3D Viewport sidebar (N key) under the "PBR Maps" tab.
 bl_info = {
     "name": "PBR Map Generator",
     "author": "PBR Map Generator",
-    "version": (1, 7, 0),
+    "version": (1, 8, 0),
     "blender": (3, 6, 0),
     "location": "3D Viewport > Sidebar (N) > PBR Maps",
     "description": "Generate normal, bump, roughness and AO maps from images, plus procedural textures",
@@ -1635,6 +1635,16 @@ class PBRGEN_Props(bpy.types.PropertyGroup):
         ],
         default="OBJECT",
         update=schedule_preview)
+    preview_spin: FloatProperty(
+        name="Spin", subtype="ANGLE", default=0.0, min=-math.pi, max=math.pi,
+        step=500, precision=0, update=_on_shape_change,
+        description="Turn the preview shape around its vertical axis, to see its other sides. "
+                    "Only the preview turns: your scene is not changed")
+    preview_tilt: FloatProperty(
+        name="Tilt", subtype="ANGLE", default=0.0, min=-math.pi / 2, max=math.pi / 2,
+        step=500, precision=0, update=_on_shape_change,
+        description="Tip the preview shape towards you (positive) or away from you (negative), "
+                    "to see more of its top or bottom. Only the preview moves: your scene is not changed")
     on_existing: EnumProperty(
         name="If It Already Exists",
         description="What to do when you generate a texture whose material already exists "
@@ -2081,6 +2091,26 @@ def selected_object_mesh():
     return mesh, Matrix.LocRotScale(None, rot, scale), obj.name
 
 
+def _preview_cam_loc(shape):
+    """Camera position for a 3 m shape centred on the origin."""
+    if shape == "PLANE":
+        return Vector((0.0, -3.0, 3.9))
+    if shape == "MONKEY":
+        return Vector((1.4, -4.4, 1.25))
+    return Vector((2.5, -3.75, 2.05))
+
+
+def preview_rotation(p, cam_loc):
+    """The user's Spin and Tilt as a matrix: spin turns the shape around the
+    world's vertical axis, then tilt tips it towards the camera (around the
+    horizontal axis square to the view), so both feel the same from any shape."""
+    spin = Matrix.Rotation(p.preview_spin, 4, "Z")
+    side = Vector((-cam_loc.y, cam_loc.x, 0.0))
+    if side.length < 1e-6:
+        side = Vector((1.0, 0.0, 0.0))
+    return Matrix.Rotation(p.preview_tilt, 4, side.normalized()) @ spin
+
+
 def render_preview(arrays, p, size=512):
     """Render the maps on the chosen shape in a temporary scene; returns PNG path."""
     if p.preview_view == "MAPS":
@@ -2142,8 +2172,13 @@ def render_preview(arrays, p, size=512):
             mesh, obj_matrix = make_shape_mesh(p.preview_shape), None
         mesh.materials.append(mat)
         shape_obj = add("PBRGenPreview_Obj", mesh, (0, 0, 0))
-        if obj_matrix is not None:
-            shape_obj.matrix_basis = obj_matrix  # same rotation & scale as in the scene
+        cam_loc = _preview_cam_loc(p.preview_shape)
+        # A selected object keeps its own rotation & scale from the scene; the
+        # user's Spin/Tilt then turns it (or the built-in shape) on top of that.
+        selected_matrix = obj_matrix
+        obj_matrix = preview_rotation(p, cam_loc) @ (
+            selected_matrix if selected_matrix is not None else Matrix.Identity(4))
+        shape_obj.matrix_basis = obj_matrix
         if p.preview_shape == "MONKEY":
             mod = shape_obj.modifiers.new("Subdivision", "SUBSURF")
             mod.levels = mod.render_levels = 2
@@ -2152,7 +2187,7 @@ def render_preview(arrays, p, size=512):
         # A selected object can be any size, anywhere, so scale the whole
         # camera + light rig around it (k = 1 for the built-in shapes).
         center, k = Vector((0.0, 0.0, 0.0)), 1.0
-        if obj_matrix is not None:
+        if selected_matrix is not None:
             pts = _mesh_points(mesh, obj_matrix)
             lo, hi = pts.min(axis=0), pts.max(axis=0)
             center = Vector(((lo + hi) / 2).tolist())
@@ -2163,10 +2198,7 @@ def render_preview(arrays, p, size=512):
         cam_data.lens = 50
         cam_data.clip_start = 0.01 * k
         cam_data.clip_end = 100.0 * k
-        cam_loc = (0.0, -3.0, 3.9) if p.preview_shape == "PLANE" else (2.5, -3.75, 2.05)
-        if p.preview_shape == "MONKEY":
-            cam_loc = (1.4, -4.4, 1.25)
-        cam = add("PBRGenPreview_Cam", cam_data, center + Vector(cam_loc) * k)
+        cam = add("PBRGenPreview_Cam", cam_data, center + cam_loc * k)
         _aim(cam, center)
         scene.camera = cam
         # Close-up zooms in until the surface fills the frame, so detail is easy to judge.
@@ -2478,6 +2510,40 @@ Nothing is added to your scene"""
         return {"FINISHED"}
 
 
+class PBRGEN_OT_rotate_preview(bpy.types.Operator):
+    """Turn the preview shape by 45 degrees"""
+    bl_idname = "pbrgen.rotate_preview"
+    bl_label = "Turn Preview"
+    bl_options = {"INTERNAL"}
+
+    amount: FloatProperty(name="Amount", subtype="ANGLE", default=math.radians(45))
+
+    @classmethod
+    def description(cls, context, props):
+        side = "left" if props.amount < 0 else "right"
+        return "Turn the preview shape %d° to the %s, to see its other sides. " \
+               "Only the preview turns: your scene is not changed" % (round(math.degrees(abs(props.amount))), side)
+
+    def execute(self, context):
+        p = context.scene.pbrgen
+        # wrap around, so turning keeps going past 180°
+        p.preview_spin = (p.preview_spin + self.amount + math.pi) % (2 * math.pi) - math.pi
+        return {"FINISHED"}
+
+
+class PBRGEN_OT_reset_preview_rotation(bpy.types.Operator):
+    """Put the preview shape back to its default position (no spin or tilt)"""
+    bl_idname = "pbrgen.reset_preview_rotation"
+    bl_label = "Reset Position"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        p = context.scene.pbrgen
+        p.preview_spin = 0.0
+        p.preview_tilt = 0.0
+        return {"FINISHED"}
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -2531,6 +2597,17 @@ class PBRGEN_PT_preview(PBRGEN_PT_base, bpy.types.Panel):
                                  icon="INFO")
         else:
             layout.label(text="Shape: " + p.bl_rna.properties["preview_shape"].enum_items[p.preview_shape].name)
+        if p.preview_view != "MAPS":
+            col = layout.column(align=True)
+            row = col.row(align=True)
+            row.operator("pbrgen.rotate_preview", text="", icon="TRIA_LEFT").amount = -math.radians(45)
+            row.prop(p, "preview_spin")
+            row.operator("pbrgen.rotate_preview", text="", icon="TRIA_RIGHT").amount = math.radians(45)
+            row = col.row(align=True)
+            row.prop(p, "preview_tilt")
+            sub = row.row(align=True)
+            sub.enabled = abs(p.preview_spin) > 1e-6 or abs(p.preview_tilt) > 1e-6
+            sub.operator("pbrgen.reset_preview_rotation", text="Reset", icon="LOOP_BACK")
         layout.row().prop(p, "projection", expand=True)
         row = layout.row(align=True)
         row.operator("pbrgen.preview", icon="FILE_REFRESH")
@@ -2641,6 +2718,8 @@ classes = (
     PBRGEN_OT_from_image,
     PBRGEN_OT_procedural,
     PBRGEN_OT_preview,
+    PBRGEN_OT_rotate_preview,
+    PBRGEN_OT_reset_preview_rotation,
     PBRGEN_PT_preview,
     PBRGEN_PT_image,
     PBRGEN_PT_procedural,
