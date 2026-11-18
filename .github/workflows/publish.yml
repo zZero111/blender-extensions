@@ -18,13 +18,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      BLENDER_VERSION: 4.5.3
+      BLENDER_VERSION: 4.5.16
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Blender
         run: |
-          curl -sSL "https://download.blender.org/release/Blender4.5/blender-${BLENDER_VERSION}-linux-x64.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          curl -fsSL "https://download.blender.org/release/Blender4.5/blender-${BLENDER_VERSION}-linux-x64.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/blender-${BLENDER_VERSION}-linux-x64" >> "$GITHUB_PATH"
 
       - name: Build extensions
