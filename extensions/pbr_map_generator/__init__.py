@@ -20,7 +20,7 @@ Find it in the 3D Viewport sidebar (N key) under the "PBR Maps" tab.
 bl_info = {  # only used by the old add-on system; blender_manifest.toml is what counts
     "name": "PBR Map Generator",
     "author": "PBR Map Generator",
-    "version": (1, 13, 0),
+    "version": (1, 13, 1),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > PBR Maps",
     "description": "Generate normal, bump, roughness and AO maps from images, plus procedural textures",
@@ -3013,6 +3013,13 @@ class PBRGEN_Props(bpy.types.PropertyGroup):
     tyre_mud: FloatProperty(
         name="Mud", default=0.0, min=0.0, max=1.0, subtype="FACTOR",
         description="Mud caked into the grooves and on the sidewall")
+    tyre_rim_size: FloatProperty(
+        name="Rim Size", default=0.0, min=0.0, max=0.95, subtype="FACTOR",
+        description="Where the rim starts, as a fraction of the tyre's outer radius. Inside it the material "
+                    "shows plain metal (for wheels where tyre and rim are one object). 0 = Auto")
+    tyre_rim_color: FloatVectorProperty(
+        name="Rim Color", subtype="COLOR_GAMMA", size=3, default=(0.6, 0.6, 0.62), min=0.0, max=1.0,
+        description="Color of the metal rim, when the rim is part of the same object and material")
     tyre_axis: EnumProperty(
         name="Axle", description="Which way the wheel's axle points (in the object's own space)",
         items=[("AUTO", "Auto", "Work it out from the tyre's shape (its thinnest direction)"),
@@ -5591,9 +5598,11 @@ def tyre_arrays(settings, size):
     return _finish_arrays(tread, s, size), _finish_arrays(side, s, size)
 
 
-def tyre_geometry(obj, axis_pref="AUTO"):
+def tyre_geometry(obj, axis_pref="AUTO", rim_size=0.0):
     """Measure the tyre: its axle direction, centre, half width and inner/outer radius,
-    from the faces using the active material slot (so a separate rim doesn't count)."""
+    from the faces using the active material slot (so a separate rim doesn't count).
+    If the rim is part of the same faces, find where it starts (or use rim_size, as a
+    fraction of the outer radius); the material then shows plain metal inside that."""
     me = obj.data
     if not me.polygons:
         return None
@@ -5622,6 +5631,28 @@ def tyre_geometry(obj, axis_pref="AUTO"):
     r_out, r_in = float(r.max()), float(r.min())
     if half_w <= 0 or r_out <= 0:
         return None
+    if rim_size > 0:
+        r_in = rim_size * r_out
+    else:
+        # Is a rim part of these faces? A rim shows up as flat faces pointing along the
+        # axle that sit set back from the tyre's sides. If so, the tyre starts where its
+        # outermost sidewall faces start.
+        nrm = np.empty(len(me.polygons) * 3, np.float32)
+        me.polygons.foreach_get("normal", nrm)
+        cen = np.empty(len(me.polygons) * 3, np.float32)
+        me.polygons.foreach_get("center", cen)
+        n_ax = np.abs(nrm.reshape(-1, 3)[:, axis])
+        c_ax = np.abs(cen.reshape(-1, 3)[:, axis] - center[axis])
+        rim_faces = use & (n_ax > 0.9) & (c_ax < 0.8 * half_w)
+        outer = use & (n_ax > 0.7) & (c_ax >= 0.8 * half_w)
+        if rim_faces.any() and outer.any():
+            ov = np.unique(np.concatenate([lv[a:a + b] for a, b in zip(ls[outer], lt[outer])]))
+            allco = np.empty(len(me.vertices) * 3, np.float32)
+            me.vertices.foreach_get("co", allco)
+            orel = allco.reshape(-1, 3)[ov] - center
+            est = float(np.linalg.norm(orel[:, others], axis=1).min())
+            if 0.3 * r_out < est < 0.97 * r_out:
+                r_in = est
     if r_out - r_in < 1e-4:
         r_in = 0.0
     return {"axis": axis, "others": others, "center": tuple(float(c) for c in center),
@@ -5685,7 +5716,9 @@ def build_tyre_material(name, tmaps, smaps, geo, props):
     geom = node("ShaderNodeNewGeometry", (-1800, -800))
     vt = node("ShaderNodeVectorTransform", (-1600, -800), vector_type="NORMAL",
               convert_from="WORLD", convert_to="OBJECT")
-    L.new(geom.outputs["Normal"], vt.inputs[0])
+    # The real face direction (True Normal), not the smoothed one: with smooth shading
+    # the flat sides of a tyre get tilted normals near their edges and would pick up tread.
+    L.new(geom.outputs["True Normal"], vt.inputs[0])
     sepn = node("ShaderNodeSeparateXYZ", (-1400, -800))
     L.new(vt.outputs[0], sepn.inputs[0])
     side_mask = node("ShaderNodeMapRange", (-1100, -800))
@@ -5745,8 +5778,28 @@ def build_tyre_material(name, tmaps, smaps, geo, props):
     aom.inputs[0].default_value = props.ao_mix
     L.new(color, _socket(aom.inputs, "A_Color", 6))
     L.new(ao, _socket(aom.inputs, "B_Color", 7))
-    L.new(_socket(aom.outputs, "Result_Color", 2), bsdf.inputs["Base Color"])
-    L.new(rough, bsdf.inputs["Roughness"])
+    # Inside the tyre's inner edge is the rim (when it shares this material): plain metal.
+    rim = node("ShaderNodeMapRange", (950, 800), label="Rim Mask")
+    # (a hair outside the tyre's inner edge, so the wall of a recessed rim counts as rim)
+    rim.inputs["From Min"].default_value = geo["r_in"] * 1.02
+    rim.inputs["From Max"].default_value = geo["r_in"] * 1.005
+    L.new(radius, rim.inputs["Value"])
+    rim_mask = rim.outputs["Result"]
+
+    def blend(kind, a_sock, b_val, label, loc):
+        m = node("ShaderNodeMix", loc, data_type=kind, label=label)
+        L.new(rim_mask, m.inputs[0])
+        ia, ib, io = (("A_Color", 6), ("B_Color", 7), ("Result_Color", 2)) if kind == "RGBA" else                      (("A_Float", 2), ("B_Float", 3), ("Result_Float", 0))
+        L.new(a_sock, _socket(m.inputs, *ia))
+        _socket(m.inputs, *ib).default_value = b_val
+        return _socket(m.outputs, *io)
+
+    rim_col = tuple(props.tyre_rim_color) + (1.0,)
+    L.new(blend("RGBA", _socket(aom.outputs, "Result_Color", 2), rim_col, "Rim Color", (1150, 650)),
+          bsdf.inputs["Base Color"])
+    L.new(blend("FLOAT", rough, 0.3, "Rim Roughness", (1150, 150)), bsdf.inputs["Roughness"])
+    L.new(rim_mask, bsdf.inputs["Metallic"])
+    height = blend("RGBA", height, (0.5, 0.5, 0.5, 1.0), "No Bumps on Rim", (1000, -300))
     bump = node("ShaderNodeBump", (1150, -300))
     # Lug depth relative to the tyre's size.
     bump.inputs["Distance"].default_value = geo["r_out"] * 0.06 * props.normal_strength / 4.0
@@ -5796,7 +5849,7 @@ active material slot, so pick the tyre's slot if the rim is part of the same obj
         if obj is None or obj.type != "MESH":
             self.report({"ERROR"}, "Select the tyre (a mesh object) first")
             return {"CANCELLED"}
-        geo = tyre_geometry(obj, p.tyre_axis)
+        geo = tyre_geometry(obj, p.tyre_axis, p.tyre_rim_size)
         if geo is None:
             self.report({"ERROR"}, "Couldn't measure that object as a tyre")
             return {"CANCELLED"}
@@ -6394,6 +6447,9 @@ class PBRGEN_PT_tyre(PBRGEN_PT_base, bpy.types.Panel):
         col.prop(p, "tyre_tread_repeats")
         col.prop(p, "tyre_side_repeats")
         col.prop(p, "tyre_side_blocks")
+        row = layout.row(align=True)
+        row.prop(p, "tyre_rim_size")
+        row.prop(p, "tyre_rim_color", text="")
         layout.row().prop(p, "tyre_axis", expand=True)
         layout.operator("pbrgen.tyre", icon="MESH_TORUS")
         layout.label(text="Uses the active material slot", icon="INFO")
