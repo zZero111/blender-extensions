@@ -20,7 +20,7 @@ Find it in the 3D Viewport sidebar (N key) under the "PBR Maps" tab.
 bl_info = {  # only used by the old add-on system; blender_manifest.toml is what counts
     "name": "PBR Map Generator",
     "author": "PBR Map Generator",
-    "version": (1, 12, 0),
+    "version": (1, 13, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > PBR Maps",
     "description": "Generate normal, bump, roughness and AO maps from images, plus procedural textures",
@@ -1374,6 +1374,94 @@ def add_engine_maps(arrays, pack):
     return out
 
 
+def pat_tread(p, size, rng):
+    """Tyre tread. Along the texture (left-right) goes around the tyre; up-down is
+    across the tread width. Staggered chunky lugs in a chevron, with zig-zag sipes."""
+    around, across = max(1, p.tex_count_y), max(1, p.tex_count_x)
+    chev = getattr(p, "tread_chevron", 0.5)
+    yy, xx = pixel_grid(size)
+    v = yy / size * across
+    row = np.floor(v).astype(np.int64)
+    fv = v - row
+    # Chevron: lugs lean towards the middle of the tread from both sides.
+    u = xx / size * around + (row % 2) * p.tex_offset + np.abs(yy / size - 0.5) * chev
+    col = np.floor(u).astype(np.int64)
+    fu = u - col
+    bw, bh = size / around, size / across
+    d = np.minimum(np.minimum(fu, 1 - fu) * bw, np.minimum(fv, 1 - fv) * bh)
+    out = shade_cells(p, size, d, col % around, row, min(bw, bh), rng)
+    m = out["mask"]
+    # Sipes: thin zig-zag slits across each lug (lots on snow tyres, for grip).
+    n_sipes = int(round(p.tex_detail * 4))
+    if n_sipes:
+        zig = 0.12 * np.abs(_frac(fv * 3.0) - 0.5)
+        s = np.abs(_frac(fu * (n_sipes + 1) + zig) - 0.5)
+        cut =smoothstep(0.5 - max(1.2, size / 900) / (bw / (n_sipes + 1)), 0.5, s)
+        sipe = cut * m * smoothstep(0.08, 0.2, np.minimum(fv, 1 - fv))
+        out["height"] = out["height"] - sipe * 0.35
+        out["albedo"] = out["albedo"] * (1 - 0.5 * sipe[..., None])
+    # Rubber: tread tops a little smoother than the grooves.
+    out["rough"] = np.clip(out["rough"] - m * 0.08, 0, 1)
+    return out
+
+
+def _glyph_bits(seed, n=64):
+    """n random 3x5 'letters' (enough to read as lettering from a distance)."""
+    r = np.random.default_rng(seed + 4242)
+    g = r.random((n, 5, 3)) < 0.58
+    g[:, :, 1] |= r.random((n, 5)) < 0.25  # strokes down the middle, like real letters
+    return g
+
+
+def pat_sidewall(p, size, rng):
+    """Tyre sidewall. Left-right goes around the tyre; bottom is the rim, top is the
+    tread shoulder. Rubber grain, ridges, raised lettering and shoulder blocks."""
+    yy, xx = pixel_grid(size)
+    u, v = xx / size, yy / size
+    grain = fbm(size, size, max(16, size // 32), 3, rng)
+    height = 0.4 + (grain - 0.5) * 0.04 * p.tex_bump
+    # A soft bulge across the wall, and thin rings near the rim and below the shoulder.
+    height = height + 0.06 * np.sin(np.clip(v, 0, 1) * np.pi)
+    for c, w in ((0.1, 0.006), (0.68, 0.005)):
+        height = height + 0.08 * np.exp(-((v - c) / w) ** 2)
+    letters_on = np.zeros((size, size), np.float32)
+    # Raised lettering band: words of blocky letters going round the tyre.
+    if p.tex_detail > 0:
+        v0, v1 = 0.36, 0.52
+        band_h = (v1 - v0) * size
+        char_w = band_h * 0.62
+        n_chars = max(8, int(size / char_w))
+        cu = u * n_chars
+        ci = np.floor(cu).astype(np.int64) % n_chars
+        fx = cu - np.floor(cu)
+        fy = (v - v0) / (v1 - v0)
+        inside = (fy >= 0) & (fy < 1)
+        glyphs = _glyph_bits(p.tex_seed)
+        gid = hash01(ci, 0, p.tex_seed, 9)
+        word_gap = hash01(ci, 1, p.tex_seed, 9) < 0.16  # spaces between words
+        gx = np.clip((fx * 4).astype(np.int64), 0, 3)
+        gy = np.clip((fy * 7 - 1).astype(np.int64), 0, 4)
+        bit = glyphs[(gid * len(glyphs)).astype(np.int64) % len(glyphs), gy, np.minimum(gx, 2)]
+        on = inside & (gx < 3) & (fy * 7 >= 1) & (fy * 7 < 6) & ~word_gap & bit
+        letters_on = gauss_blur(on.astype(np.float32), max(1, size // 900)) * min(1.0, p.tex_detail * 2)
+        height = height + letters_on * 0.07
+    # Shoulder blocks where the sidewall meets the tread (off-road tyres).
+    n = max(1, p.tex_count_x)
+    uu = u * n
+    c = np.floor(uu).astype(np.int64)
+    fu = uu - c
+    start = np.where(c % 2 == 0, 0.8, 0.86)
+    unit = size / n
+    d = np.minimum(np.minimum(fu, 1 - fu) * unit - p.tex_gap * unit * 0.5, (v - start) * size)
+    block = smoothstep(0.0, max(1.0, p.tex_bevel * unit * 0.3), d)
+    height = np.maximum(height, block * (0.62 + (grain - 0.5) * 0.04))
+    rubber = _color(p.tex_color1) * (0.9 + 0.2 * grain[..., None])
+    rubber = _mix(rubber, _color(p.tex_color2), block[..., None] * 0.5)
+    albedo = _mix(rubber, _color(p.tex_gap_color), letters_on[..., None])
+    rough = np.clip(p.tex_rough + (grain - 0.5) * 0.06 - letters_on * 0.1, 0, 1)
+    return {"height": np.clip(height, 0, 1), "albedo": albedo, "rough": rough}
+
+
 PATTERNS = {
     "BRICKS": ("Bricks", pat_bricks),
     "STONES": ("Cobblestones", pat_stones),
@@ -1403,6 +1491,8 @@ PATTERNS = {
     "CHAINMAIL": ("Chainmail", pat_chainmail),
     "WICKER": ("Wicker", pat_wicker),
     "SCALES": ("Scales", pat_scales),
+    "TREAD": ("Tyre Tread", pat_tread),
+    "SIDEWALL": ("Tyre Sidewall", pat_sidewall),
 }
 
 # Each pattern's number is what .blend files store, so existing ones never change.
@@ -1410,7 +1500,8 @@ PATTERN_IDS = {k: i for i, k in enumerate(
     ["BRICKS", "STONES", "GRAVEL", "ROOF", "TILES", "HEX", "TERRAZZO", "PLANKS", "HERRINGBONE",
      "CONCRETE", "PLASTER", "ASPHALT", "ROCK", "MUD", "SAND", "BARK", "METAL", "CORRUGATED",
      "RUSTY", "FABRIC", "LEATHER",
-     "FLAGSTONES", "CARPET", "GRASS", "DIAMOND", "CHAINMAIL", "WICKER", "SCALES"])}
+     "FLAGSTONES", "CARPET", "GRASS", "DIAMOND", "CHAINMAIL", "WICKER", "SCALES",
+     "TREAD", "SIDEWALL"])}
 
 # Dropdown layout: (heading, [pattern keys]) with a tooltip per pattern.
 PATTERN_GROUPS = (
@@ -1419,6 +1510,7 @@ PATTERN_GROUPS = (
     ("Walls & Ground", ["CONCRETE", "PLASTER", "ASPHALT", "ROCK", "MUD", "SAND", "GRASS", "BARK"]),
     ("Metal", ["METAL", "DIAMOND", "CORRUGATED", "RUSTY", "CHAINMAIL"]),
     ("Fabric & Natural", ["FABRIC", "WICKER", "LEATHER", "SCALES"]),
+    ("Vehicle", ["TREAD", "SIDEWALL"]),
 )
 PATTERN_TIPS = {
     "BRICKS": "Brick wall with mortar",
@@ -1449,6 +1541,8 @@ PATTERN_TIPS = {
     "CHAINMAIL": "Interlocking metal rings",
     "WICKER": "Woven wicker or rattan, like a basket",
     "SCALES": "Overlapping fish, reptile or dragon scales",
+    "TREAD": "Tyre tread with chunky lugs and sipes (for UV-mapped tyres; see the Tyre panel for automatic wrapping)",
+    "SIDEWALL": "Tyre sidewall with ridges, raised lettering and shoulder blocks (bottom = rim, top = tread)",
 }
 
 
@@ -1517,6 +1611,13 @@ PATTERN_UI = {
                 "detail": "Fibers", "color1": "Strand Color", "color2": "Cross Strand Color", "gap_color": "Gap Color"}),
     "SCALES": (["count_x", "count_y", "bevel", "bump", "color1", "color2", "gap_color", "variation", "rough"],
                {"count_x": "Scales Across", "count_y": "Scale Rows", "bevel": "Rim Softness", "gap_color": "Gap Color"}),
+    "TREAD": (["count_x", "count_y", "offset", "gap", "bevel", "wear", "bump", "detail", "color1", "color2", "gap_color", "variation", "rough", "rough_gap"],
+              {"count_x": "Lugs Across", "count_y": "Lugs Around", "offset": "Stagger", "gap": "Groove Width",
+               "bevel": "Lug Rounding", "wear": "Chipped Lugs", "bump": "Rubber Texture", "detail": "Sipes (snow grip)",
+               "color1": "Rubber Color", "color2": "Rubber Color 2", "gap_color": "Groove Color"}),
+    "SIDEWALL": (["count_x", "gap", "bevel", "bump", "detail", "color1", "color2", "gap_color", "rough"],
+                 {"count_x": "Shoulder Blocks", "gap": "Block Gap", "bevel": "Block Rounding", "bump": "Rubber Texture",
+                  "detail": "Lettering", "color1": "Rubber Color", "color2": "Block Color", "gap_color": "Lettering Color"}),
 }
 
 # Good starting values loaded whenever the pattern is changed.
@@ -1591,6 +1692,12 @@ PRESETS = {
     "SCALES": dict(count_x=10, count_y=20, bevel=0.3, bump=0.3, variation=0.25,
                    color1=(0.18, 0.34, 0.20), color2=(0.10, 0.22, 0.16), gap_color=(0.03, 0.05, 0.03),
                    rough=0.35),
+    "TREAD": dict(count_x=4, count_y=2, offset=0.5, gap=0.32, bevel=0.12, wear=0.3, bump=0.25, detail=0.25,
+                  color1=(0.035, 0.035, 0.037), color2=(0.05, 0.05, 0.052), gap_color=(0.02, 0.02, 0.02),
+                  variation=0.03, rough=0.8, rough_gap=0.9),
+    "SIDEWALL": dict(count_x=12, gap=0.35, bevel=0.3, bump=0.4, detail=1.0,
+                     color1=(0.035, 0.035, 0.037), color2=(0.05, 0.05, 0.052), gap_color=(0.8, 0.8, 0.78),
+                     rough=0.75),
 }
 
 
@@ -2876,6 +2983,41 @@ class PBRGEN_Props(bpy.types.PropertyGroup):
         default="2k")
     ph_pick: EnumProperty(name="Texture", items=_dyn_items("_ph_items"),
                           description="The Poly Haven texture to download")
+
+    # --- tyres
+    tyre_style: EnumProperty(
+        name="Tread", description="Kind of tyre tread",
+        items=[("OFFROAD", "Off-road", "Big chunky staggered lugs with wide grooves"),
+               ("SNOW", "Snow / Winter", "Smaller blocks covered in zig-zag sipes that bite into snow and ice"),
+               ("MUD", "Mud Terrain", "Huge angled paddles with very wide gaps that throw mud out"),
+               ("ALLTERRAIN", "All-terrain", "Medium blocks with some sipes: a mix of road and off-road")],
+        default="OFFROAD")
+    tyre_letters: EnumProperty(
+        name="Lettering", description="Raised lettering round the sidewall",
+        items=[("NONE", "None", "Plain sidewall"),
+               ("RAISED", "Raised", "Raised black rubber lettering"),
+               ("WHITE", "White", "Raised white lettering, like classic off-road tyres")],
+        default="RAISED")
+    tyre_tread_repeats: IntProperty(
+        name="Tread Repeats", default=0, min=0, max=200,
+        description="How many times the tread pattern goes round the tyre. 0 = Auto (lugs keep their shape)")
+    tyre_side_repeats: IntProperty(
+        name="Sidewall Repeats", default=0, min=0, max=50,
+        description="How many times the sidewall pattern goes round. 0 = Auto")
+    tyre_side_blocks: IntProperty(
+        name="Shoulder Blocks", default=36, min=0, max=200,
+        description="How many chunky blocks go round the edge of the sidewall, next to the tread")
+    tyre_snow: FloatProperty(
+        name="Packed Snow", default=0.0, min=0.0, max=1.0, subtype="FACTOR",
+        description="Snow packed into the grooves and between the lugs")
+    tyre_mud: FloatProperty(
+        name="Mud", default=0.0, min=0.0, max=1.0, subtype="FACTOR",
+        description="Mud caked into the grooves and on the sidewall")
+    tyre_axis: EnumProperty(
+        name="Axle", description="Which way the wheel's axle points (in the object's own space)",
+        items=[("AUTO", "Auto", "Work it out from the tyre's shape (its thinnest direction)"),
+               ("X", "X", ""), ("Y", "Y", ""), ("Z", "Z", "")],
+        default="AUTO")
 
     # --- baking
     bake_maps: EnumProperty(
@@ -5382,6 +5524,323 @@ Needs enough vertices to hold the detail"""
         return {"FINISHED"}
 
 
+# ---------------------------------------------------------------------------
+# Tyres: tread + sidewall wrapped round the wheel automatically (no UVs needed)
+# ---------------------------------------------------------------------------
+
+TYRE_STYLES = {
+    "OFFROAD": dict(count_x=4, count_y=2, offset=0.5, gap=0.32, bevel=0.12, wear=0.3, bump=0.25, detail=0.25, chevron=0.5),
+    "SNOW": dict(count_x=6, count_y=3, offset=0.35, gap=0.16, bevel=0.08, wear=0.15, bump=0.2, detail=1.0, chevron=0.35),
+    "MUD": dict(count_x=3, count_y=1, offset=0.5, gap=0.45, bevel=0.15, wear=0.4, bump=0.3, detail=0.0, chevron=0.9),
+    "ALLTERRAIN": dict(count_x=5, count_y=3, offset=0.5, gap=0.22, bevel=0.1, wear=0.2, bump=0.2, detail=0.5, chevron=0.4),
+}
+RUBBER = dict(color1=(0.035, 0.035, 0.037), color2=(0.05, 0.05, 0.052), gap_color=(0.02, 0.02, 0.02),
+              variation=0.03, rough=0.8, rough_gap=0.9)
+
+
+def _finish_arrays(data, p, size):
+    height = np.clip(data["height"], 0, 1)
+    normal = height_to_normal(height, p.normal_strength * size / 1024.0 * 2.0, p.directx_normal)
+    ao = height_to_ao(height, max(2, int(p.ao_radius * size / 1024.0)), p.ao_strength * 0.5)
+    albedo = np.clip(data["albedo"], 0, 1) * (0.75 + 0.25 * ao[..., None])
+    return {"albedo": albedo, "height": height, "normal": normal,
+            "roughness": np.clip(data["rough"], 0, 1), "ao": ao}
+
+
+def pack_grooves(data, size, amount, color, rough, seed):
+    """Fill the low parts (grooves, between lugs) with packed snow or mud."""
+    if amount <= 0:
+        return data
+    rng = np.random.default_rng(seed)
+    h = np.clip(data["height"], 0, 1)
+    around = gauss_blur(h, max(2, size // 48))
+    groove = smoothstep(0.03, 0.1, around - h)          # only real grooves and gaps
+    clumps = normalize01(fbm(size, size, 5, 4, rng))
+    noise = fbm(size, size, 24, 3, rng)
+    # Patchy: packed full in some places, clean rubber in others; more amount = more patches.
+    t = 0.85 - amount * 0.6
+    patch = smoothstep(t, t + 0.12, clumps + (noise - 0.5) * 0.25)
+    m = groove * patch
+    out = dict(data)
+    out["albedo"] = _mix(np.clip(data["albedo"], 0, 1), _color(color) * (0.85 + 0.3 * noise[..., None]), m[..., None])
+    out["rough"] = data["rough"] * (1 - m) + rough * m
+    out["height"] = np.maximum(h, h * (1 - m) + (around + 0.02) * m)
+    return out
+
+
+def tyre_arrays(settings, size):
+    """(tread maps, sidewall maps) for the chosen tyre style."""
+    s = SimpleNamespace(**vars(settings))
+    for k, v in RUBBER.items():
+        setattr(s, "tex_" + k, v)
+    style = TYRE_STYLES[settings.tyre_style]
+    for k, v in style.items():
+        setattr(s, "tex_" + k, v)
+    s.tread_chevron = style["chevron"]
+    tread = pat_tread(s, size, np.random.default_rng(s.tex_seed))
+    w = SimpleNamespace(**vars(s))
+    w.tex_count_x = max(1, round(settings.tyre_side_blocks / max(1, settings._side_repeats)))
+    w.tex_gap, w.tex_bevel, w.tex_bump, w.tex_rough = 0.35, 0.3, 0.4, 0.75
+    w.tex_detail = 0.0 if settings.tyre_letters == "NONE" else 1.0
+    w.tex_gap_color = (0.8, 0.8, 0.78) if settings.tyre_letters == "WHITE" else (0.045, 0.045, 0.047)
+    side = pat_sidewall(w, size, np.random.default_rng(s.tex_seed + 1))
+    for amount, color, rough, salt in ((settings.tyre_mud, (0.16, 0.11, 0.07), 0.9, 11),
+                                       (settings.tyre_snow, (0.78, 0.81, 0.86), 0.55, 12)):
+        tread = pack_grooves(tread, size, amount, color, rough, s.tex_seed + salt)
+        side = pack_grooves(side, size, amount * 0.25, color, rough, s.tex_seed + salt + 1)
+    return _finish_arrays(tread, s, size), _finish_arrays(side, s, size)
+
+
+def tyre_geometry(obj, axis_pref="AUTO"):
+    """Measure the tyre: its axle direction, centre, half width and inner/outer radius,
+    from the faces using the active material slot (so a separate rim doesn't count)."""
+    me = obj.data
+    if not me.polygons:
+        return None
+    mi = np.empty(len(me.polygons), np.int64)
+    me.polygons.foreach_get("material_index", mi)
+    use = mi == obj.active_material_index
+    if not use.any() or len(obj.material_slots) <= 1:
+        use[:] = True
+    ls = np.empty(len(me.polygons), np.int64)
+    lt = np.empty(len(me.polygons), np.int64)
+    me.polygons.foreach_get("loop_start", ls)
+    me.polygons.foreach_get("loop_total", lt)
+    lv = np.empty(len(me.loops), np.int64)
+    me.loops.foreach_get("vertex_index", lv)
+    idx = np.concatenate([lv[a:a + b] for a, b in zip(ls[use], lt[use])])
+    co = np.empty(len(me.vertices) * 3, np.float32)
+    me.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3)[np.unique(idx)]
+    lo, hi = co.min(0), co.max(0)
+    axis = int(np.argmin(hi - lo)) if axis_pref == "AUTO" else "XYZ".index(axis_pref)
+    center = (lo + hi) / 2
+    others = [i for i in range(3) if i != axis]
+    rel = co - center
+    r = np.linalg.norm(rel[:, others], axis=1)
+    half_w = float(np.abs(rel[:, axis]).max())
+    r_out, r_in = float(r.max()), float(r.min())
+    if half_w <= 0 or r_out <= 0:
+        return None
+    if r_out - r_in < 1e-4:
+        r_in = 0.0
+    return {"axis": axis, "others": others, "center": tuple(float(c) for c in center),
+            "half_w": half_w, "r_in": r_in, "r_out": r_out}
+
+
+def build_tyre_material(name, tmaps, smaps, geo, props):
+    mat = bpy.data.materials.new(name)
+    try:
+        mat.use_nodes = True
+    except AttributeError:
+        pass
+    nt = mat.node_tree
+    N, L = nt.nodes, nt.links
+    N.clear()
+
+    def node(idname, loc, **kw):
+        n = N.new(idname)
+        n.location = loc
+        for k, v in kw.items():
+            setattr(n, k, v)
+        return n
+
+    def math(op, a, b=None, loc=(0, 0), clamp=False):
+        n = node("ShaderNodeMath", loc, operation=op, use_clamp=clamp)
+        for i, x in enumerate((a, b)):
+            if x is None:
+                continue
+            if isinstance(x, bpy.types.NodeSocket):
+                L.new(x, n.inputs[i])
+            else:
+                n.inputs[i].default_value = x
+        return n.outputs[0]
+
+    out = node("ShaderNodeOutputMaterial", (1700, 0))
+    bsdf = node("ShaderNodeBsdfPrincipled", (1400, 0))
+    L.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+
+    # Position around the wheel's own centre and axle.
+    coord = node("ShaderNodeTexCoord", (-2200, 0))
+    sub = node("ShaderNodeVectorMath", (-2000, 0), operation="SUBTRACT")
+    L.new(coord.outputs["Object"], sub.inputs[0])
+    sub.inputs[1].default_value = geo["center"]
+    sep = node("ShaderNodeSeparateXYZ", (-1800, 0))
+    L.new(sub.outputs[0], sep.inputs[0])
+    axial = sep.outputs[geo["axis"]]
+    a, b = sep.outputs[geo["others"][0]], sep.outputs[geo["others"][1]]
+    # u: how far round the tyre (0..1); v: across the tread / out from the rim.
+    ang = math("ARCTAN2", b, a, (-1600, 200))
+    u = math("ADD", math("MULTIPLY", ang, 1 / (2 * math_pi()), (-1450, 200)), 0.5, (-1300, 200))
+    v_tread = math("ADD", math("MULTIPLY", axial, 0.5 / geo["half_w"], (-1450, 0)), 0.5, (-1300, 0))
+    radius = math("SQRT", math("ADD", math("MULTIPLY", a, a, (-1600, -250)),
+                               math("MULTIPLY", b, b, (-1600, -350)), (-1450, -300)), None, (-1300, -300))
+    span = max(1e-4, geo["r_out"] - geo["r_in"])
+    v_side = math("MULTIPLY", math("SUBTRACT", radius, geo["r_in"], (-1150, -300)), 1 / span, (-1000, -300))
+    # The sidewall on the far side is seen from the other direction: flip it so lettering reads right.
+    side_sign = math("SIGN", axial, None, (-1450, -500))
+    u_side = math("ADD", math("MULTIPLY", math("SUBTRACT", u, 0.5, (-1150, -500)), side_sign, (-1000, -500)),
+                  0.5, (-850, -500))
+    # Where the tyre faces sideways it's sidewall, where it faces outwards it's tread.
+    geom = node("ShaderNodeNewGeometry", (-1800, -800))
+    vt = node("ShaderNodeVectorTransform", (-1600, -800), vector_type="NORMAL",
+              convert_from="WORLD", convert_to="OBJECT")
+    L.new(geom.outputs["Normal"], vt.inputs[0])
+    sepn = node("ShaderNodeSeparateXYZ", (-1400, -800))
+    L.new(vt.outputs[0], sepn.inputs[0])
+    side_mask = node("ShaderNodeMapRange", (-1100, -800))
+    side_mask.inputs["From Min"].default_value = 0.45
+    side_mask.inputs["From Max"].default_value = 0.75
+    L.new(math("ABSOLUTE", sepn.outputs[geo["axis"]], None, (-1250, -800)), side_mask.inputs["Value"])
+    mask = side_mask.outputs["Result"]
+
+    # Two lookups per map with the seam in different places, keeping whichever is
+    # far from its seam: no thin line where the texture wraps round (Eevee mipmaps).
+    u_alt = math("SUBTRACT", math("FRACT", math("ADD", u, 0.5, (-1150, 450)), None, (-1000, 450)), 0.5, (-850, 450))
+    use_alt = math("GREATER_THAN", math("ABSOLUTE", math("SUBTRACT", u, 0.5, (-1150, 650)), None, (-1000, 650)),
+                   0.25, (-850, 650))
+    us_alt = math("SUBTRACT", math("FRACT", math("ADD", u_side, 0.5, (-700, -650)), None, (-550, -650)), 0.5, (-400, -650))
+    uses_alt = math("GREATER_THAN", math("ABSOLUTE", math("SUBTRACT", u_side, 0.5, (-700, -800)), None, (-550, -800)),
+                    0.25, (-400, -800))
+
+    def vec(uu, vv, rep, loc):
+        c = node("ShaderNodeCombineXYZ", loc)
+        L.new(math("MULTIPLY", uu, float(rep), (loc[0] - 150, loc[1])), c.inputs[0])
+        L.new(vv, c.inputs[1])
+        return c.outputs[0]
+
+    tr, sr = tyre_repeats(props, geo)
+    vecs = {"tread": (vec(u, v_tread, tr, (-650, 300)), vec(u_alt, v_tread, tr, (-650, 200)), use_alt),
+            "side": (vec(u_side, v_side, sr, (-200, -500)), vec(us_alt, v_side, sr, (-200, -600)), uses_alt)}
+
+    def sample(img, which, label, y):
+        va, vb, sel = vecs[which]
+        res = []
+        for k, vv in enumerate((va, vb)):
+            t = node("ShaderNodeTexImage", (0 + 200 * k, y), image=img, label="%s (%s)" % (label, which))
+            t.hide = True
+            L.new(vv, t.inputs["Vector"])
+            res.append(t.outputs["Color"])
+        m = node("ShaderNodeMix", (450, y), data_type="RGBA")
+        m.hide = True
+        L.new(sel, m.inputs[0])
+        L.new(res[0], _socket(m.inputs, "A_Color", 6))
+        L.new(res[1], _socket(m.inputs, "B_Color", 7))
+        return _socket(m.outputs, "Result_Color", 2)
+
+    def both(key, label, y):
+        t = sample(tmaps[key], "tread", label, y)
+        s = sample(smaps[key], "side", label, y - 60)
+        m = node("ShaderNodeMix", (650, y), data_type="RGBA", label=label)
+        L.new(mask, m.inputs[0])
+        L.new(t, _socket(m.inputs, "A_Color", 6))
+        L.new(s, _socket(m.inputs, "B_Color", 7))
+        return _socket(m.outputs, "Result_Color", 2)
+
+    color = both("albedo", "Base Color", 600)
+    ao = both("ao", "Ambient Occlusion", 300)
+    rough = both("roughness", "Roughness", 0)
+    height = both("height", "Height / Bump", -300)
+    aom = node("ShaderNodeMix", (950, 450), data_type="RGBA", blend_type="MULTIPLY", label="AO Multiply")
+    aom.inputs[0].default_value = props.ao_mix
+    L.new(color, _socket(aom.inputs, "A_Color", 6))
+    L.new(ao, _socket(aom.inputs, "B_Color", 7))
+    L.new(_socket(aom.outputs, "Result_Color", 2), bsdf.inputs["Base Color"])
+    L.new(rough, bsdf.inputs["Roughness"])
+    bump = node("ShaderNodeBump", (1150, -300))
+    # Lug depth relative to the tyre's size.
+    bump.inputs["Distance"].default_value = geo["r_out"] * 0.06 * props.normal_strength / 4.0
+    L.new(height, bump.inputs["Height"])
+    L.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
+    disp = node("ShaderNodeDisplacement", (1400, -500))
+    disp.inputs["Midlevel"].default_value = 0.5
+    disp.inputs["Scale"].default_value = geo["r_out"] * 0.06
+    L.new(height, disp.inputs["Height"])
+    if props.use_displacement:
+        L.new(disp.outputs["Displacement"], out.inputs["Displacement"])
+        if hasattr(mat, "displacement_method"):
+            mat.displacement_method = "BOTH"
+    mat["pbrgen_tyre"] = True
+    return mat
+
+
+def tyre_repeats(props, geo):
+    """How many times the tread and sidewall textures go round the tyre. Auto keeps
+    each tread tile about as long as the tread is wide, so lugs aren't stretched."""
+    tread = props.tyre_tread_repeats or max(4, round(2 * math.pi * geo["r_out"] / (2 * geo["half_w"])))
+    mid = (geo["r_out"] + geo["r_in"]) / 2
+    span = max(1e-4, geo["r_out"] - geo["r_in"])
+    side = props.tyre_side_repeats or max(1, round(2 * math.pi * mid / (span * 3)))
+    return tread, side
+
+
+def math_pi():
+    return math.pi
+
+
+class PBRGEN_OT_tyre(_ExistingChoice, bpy.types.Operator):
+    """Make a tyre material for the selected tyre: tread wrapped round it and sidewalls on \
+its sides, worked out from the tyre's shape (no UV unwrapping needed). It goes in the \
+active material slot, so pick the tyre's slot if the rim is part of the same object"""
+    bl_idname = "pbrgen.tyre"
+    bl_label = "Make Tyre Material"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def material_name(self, context):
+        p = context.scene.pbrgen
+        return "Tyre_%s_PBR" % p.bl_rna.properties["tyre_style"].enum_items[p.tyre_style].name.replace(" ", "").replace("-", "")
+
+    def execute(self, context):
+        p = context.scene.pbrgen
+        obj = context.active_object
+        if obj is None or obj.type != "MESH":
+            self.report({"ERROR"}, "Select the tyre (a mesh object) first")
+            return {"CANCELLED"}
+        geo = tyre_geometry(obj, p.tyre_axis)
+        if geo is None:
+            self.report({"ERROR"}, "Couldn't measure that object as a tyre")
+            return {"CANCELLED"}
+        replace = self.use_replace(context)
+        name = self.material_name(context)
+        base = name[:-4]
+        settings = snapshot_settings(p)
+        settings._side_repeats = tyre_repeats(p, geo)[1]
+        size = int(p.tex_res)
+        out_dir = p.out_dir
+        obj_name = obj.name
+
+        def work(stage):
+            stage("making tread and sidewall")
+            tread, side = tyre_arrays(settings, size)
+            stage("encoding images")
+            return encode_maps(tread), encode_maps(side)
+
+        def done(encoded, context):
+            tmaps = images_from_encoded(base + "_Tread", encoded[0], out_dir, replace)
+            smaps = images_from_encoded(base + "_Sidewall", encoded[1], out_dir, replace)
+            pp = context.scene.pbrgen
+            old = bpy.data.materials.get(name) if replace else None
+            mat = build_tyre_material(name, tmaps, smaps, geo, pp)
+            if replace:
+                replace_datablock(old, mat, name)
+            target = bpy.data.objects.get(obj_name)
+            msg = "Made '%s'" % mat.name
+            if target is not None:
+                slots = target.data.materials
+                if slots and target.active_material_index < len(slots):
+                    slots[target.active_material_index] = mat
+                else:
+                    slots.append(mat)
+                msg += " on '%s' (axle along %s, radius %s)" % (target.name, "XYZ"[geo["axis"]], _metres(geo["r_out"]))
+                if pp.use_displacement and pp.displacement_subdivide:
+                    add_displacement_subdivision(target, pp.displacement_levels)
+            if pp.mark_as_asset:
+                mark_asset(mat, "Tyre")
+            self.report({"INFO"}, msg)
+
+        return self.start_job(context, "Tyre", work, done)
+
+
 class PBRGEN_OT_preview(bpy.types.Operator):
     """Render a quick preview of the material on the chosen shape. \
 Nothing is added to your scene"""
@@ -5908,6 +6367,38 @@ class PBRGEN_PT_polyhaven(PBRGEN_PT_base, bpy.types.Panel):
         layout.label(text="Free CC0 textures from polyhaven.com", icon="URL")
 
 
+class PBRGEN_PT_tyre(PBRGEN_PT_base, bpy.types.Panel):
+    bl_label = "Tyre"
+    bl_idname = "PBRGEN_PT_tyre"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon="MESH_TORUS")
+
+    def draw(self, context):
+        p = context.scene.pbrgen
+        sync_viewport_overlay(context)
+        layout = self.layout
+        obj = context.active_object
+        if obj is None or obj.type != "MESH":
+            layout.label(text="Select the tyre", icon="INFO")
+        else:
+            slot = obj.active_material.name if obj.active_material else "empty slot"
+            layout.label(text="%s, slot: %s" % (obj.name, slot), icon="OBJECT_DATA")
+        layout.prop(p, "tyre_style")
+        layout.row().prop(p, "tyre_letters", expand=True)
+        col = layout.column(align=True)
+        col.prop(p, "tyre_snow", slider=True)
+        col.prop(p, "tyre_mud", slider=True)
+        col = layout.column(align=True)
+        col.prop(p, "tyre_tread_repeats")
+        col.prop(p, "tyre_side_repeats")
+        col.prop(p, "tyre_side_blocks")
+        layout.row().prop(p, "tyre_axis", expand=True)
+        layout.operator("pbrgen.tyre", icon="MESH_TORUS")
+        layout.label(text="Uses the active material slot", icon="INFO")
+
+
 class PBRGEN_PT_bake(PBRGEN_PT_base, bpy.types.Panel):
     bl_label = "Bake"
     bl_idname = "PBRGEN_PT_bake"
@@ -6021,6 +6512,7 @@ classes = (
     PBRGEN_OT_ph_download,
     PBRGEN_OT_bake,
     PBRGEN_OT_bake_vertex_colors,
+    PBRGEN_OT_tyre,
     PBRGEN_MT_tex_presets,
     PBRGEN_OT_add_tex_preset,
     PBRGEN_OT_preview,
@@ -6035,6 +6527,7 @@ classes = (
     PBRGEN_PT_trim,
     PBRGEN_PT_blend,
     PBRGEN_PT_polyhaven,
+    PBRGEN_PT_tyre,
     PBRGEN_PT_bake,
     PBRGEN_PT_output,
 )
