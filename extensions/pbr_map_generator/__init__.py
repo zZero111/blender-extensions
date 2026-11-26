@@ -20,7 +20,7 @@ Find it in the 3D Viewport sidebar (N key) under the "PBR Maps" tab.
 bl_info = {  # only used by the old add-on system; blender_manifest.toml is what counts
     "name": "PBR Map Generator",
     "author": "PBR Map Generator",
-    "version": (1, 13, 1),
+    "version": (1, 13, 2),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > PBR Maps",
     "description": "Generate normal, bump, roughness and AO maps from images, plus procedural textures",
@@ -384,6 +384,22 @@ def fbm(h, w, base_cells, octaves, rng):
     cells = max(1, int(base_cells))
     for _ in range(octaves):
         total += value_noise(h, w, cells, cells, rng) * amp
+        norm += amp
+        amp *= 0.5
+        cells *= 2
+    return total / norm
+
+
+def fbm_wide(h, w, base_cells, octaves, rng, asp=1.0):
+    """fbm for a texture that will be shown asp times wider than tall: more noise cells
+    across, so features come out round (not stretched) on the model."""
+    if abs(asp - 1.0) < 1e-3:
+        return fbm(h, w, base_cells, octaves, rng)
+    total = np.zeros((h, w), np.float32)
+    amp, norm = 1.0, 0.0
+    cells = max(1, int(base_cells))
+    for _ in range(octaves):
+        total += value_noise(h, w, cells, max(1, int(round(cells * asp))), rng) * amp
         norm += amp
         amp *= 0.5
         cells *= 2
@@ -1418,7 +1434,8 @@ def pat_sidewall(p, size, rng):
     tread shoulder. Rubber grain, ridges, raised lettering and shoulder blocks."""
     yy, xx = pixel_grid(size)
     u, v = xx / size, yy / size
-    grain = fbm(size, size, max(16, size // 32), 3, rng)
+    asp = getattr(p, "side_aspect", 1.0)  # how much wider than tall this tile is on the tyre
+    grain = fbm_wide(size, size, max(16, size // 32), 3, rng, asp)
     height = 0.4 + (grain - 0.5) * 0.04 * p.tex_bump
     # A soft bulge across the wall, and thin rings near the rim and below the shoulder.
     height = height + 0.06 * np.sin(np.clip(v, 0, 1) * np.pi)
@@ -1429,7 +1446,7 @@ def pat_sidewall(p, size, rng):
     if p.tex_detail > 0:
         v0, v1 = 0.36, 0.52
         band_h = (v1 - v0) * size
-        char_w = band_h * 0.62
+        char_w = band_h * 0.62 / asp
         n_chars = max(8, int(size / char_w))
         cu = u * n_chars
         ci = np.floor(cu).astype(np.int64) % n_chars
@@ -5554,7 +5571,7 @@ def _finish_arrays(data, p, size):
             "roughness": np.clip(data["rough"], 0, 1), "ao": ao}
 
 
-def pack_grooves(data, size, amount, color, rough, seed):
+def pack_grooves(data, size, amount, color, rough, seed, asp=1.0):
     """Fill the low parts (grooves, between lugs) with packed snow or mud."""
     if amount <= 0:
         return data
@@ -5562,8 +5579,8 @@ def pack_grooves(data, size, amount, color, rough, seed):
     h = np.clip(data["height"], 0, 1)
     around = gauss_blur(h, max(2, size // 48))
     groove = smoothstep(0.03, 0.1, around - h)          # only real grooves and gaps
-    clumps = normalize01(fbm(size, size, 5, 4, rng))
-    noise = fbm(size, size, 24, 3, rng)
+    clumps = normalize01(fbm_wide(size, size, 5, 4, rng, asp))
+    noise = fbm_wide(size, size, 24, 3, rng, asp)
     # Patchy: packed full in some places, clean rubber in others; more amount = more patches.
     t = 0.85 - amount * 0.6
     patch = smoothstep(t, t + 0.12, clumps + (noise - 0.5) * 0.25)
@@ -5587,6 +5604,7 @@ def tyre_arrays(settings, size):
     tread = pat_tread(s, size, np.random.default_rng(s.tex_seed))
     w = SimpleNamespace(**vars(s))
     w.tex_count_x = max(1, round(settings.tyre_side_blocks / max(1, settings._side_repeats)))
+    w.side_aspect = getattr(settings, "side_aspect", 1.0)
     w.tex_gap, w.tex_bevel, w.tex_bump, w.tex_rough = 0.35, 0.3, 0.4, 0.75
     w.tex_detail = 0.0 if settings.tyre_letters == "NONE" else 1.0
     w.tex_gap_color = (0.8, 0.8, 0.78) if settings.tyre_letters == "WHITE" else (0.045, 0.045, 0.047)
@@ -5594,7 +5612,8 @@ def tyre_arrays(settings, size):
     for amount, color, rough, salt in ((settings.tyre_mud, (0.16, 0.11, 0.07), 0.9, 11),
                                        (settings.tyre_snow, (0.78, 0.81, 0.86), 0.55, 12)):
         tread = pack_grooves(tread, size, amount, color, rough, s.tex_seed + salt)
-        side = pack_grooves(side, size, amount * 0.25, color, rough, s.tex_seed + salt + 1)
+        side = pack_grooves(side, size, amount * 0.25, color, rough, s.tex_seed + salt + 1,
+                            getattr(settings, "side_aspect", 1.0))
     return _finish_arrays(tread, s, size), _finish_arrays(side, s, size)
 
 
@@ -5659,6 +5678,42 @@ def tyre_geometry(obj, axis_pref="AUTO", rim_size=0.0):
             "half_w": half_w, "r_in": r_in, "r_out": r_out}
 
 
+TYRE_SIDE_ATTR = "pbr_tyre_side"
+
+
+def tag_tyre_object(obj, geo):
+    """Store this tyre's measurements on the object and mark which faces are sidewall,
+    from the mesh's real face directions. The tyre material reads both."""
+    me = obj.data
+    axis, others = geo["axis"], geo["others"]
+    eye = np.eye(3)
+    obj["pbr_tyre_center"] = list(geo["center"])
+    obj["pbr_tyre_axis"] = list(eye[axis])
+    obj["pbr_tyre_e1"] = list(eye[others[0]])
+    obj["pbr_tyre_e2"] = list(eye[others[1]])
+    obj["pbr_tyre_size"] = [geo["half_w"], geo["r_in"], geo["r_out"]]
+    n = len(me.polygons)
+    nrm = np.empty(n * 3, np.float32)
+    me.polygons.foreach_get("normal", nrm)
+    cen = np.empty(n * 3, np.float32)
+    me.polygons.foreach_get("center", cen)
+    nrm, cen = nrm.reshape(-1, 3), cen.reshape(-1, 3) - np.array(geo["center"], np.float32)
+    ra = cen[:, others]
+    rr = np.maximum(np.linalg.norm(ra, axis=1), 1e-6)
+    outward = (nrm[:, others] * ra).sum(1) / rr
+    side = np.clip((np.abs(nrm[:, axis]) - 0.45) / 0.3, 0, 1)
+    inward = np.clip((0.3 - outward) / 0.3, 0, 1)      # the tyre's inner lip faces the axle
+    value = np.maximum(side, inward).astype(np.float32)
+    attr = me.attributes.get(TYRE_SIDE_ATTR)
+    if attr is not None and (attr.domain != "FACE" or attr.data_type != "FLOAT"):
+        me.attributes.remove(attr)
+        attr = None
+    if attr is None:
+        attr = me.attributes.new(TYRE_SIDE_ATTR, "FLOAT", "FACE")
+    attr.data.foreach_set("value", value)
+    me.update()
+
+
 def build_tyre_material(name, tmaps, smaps, geo, props):
     mat = bpy.data.materials.new(name)
     try:
@@ -5691,41 +5746,45 @@ def build_tyre_material(name, tmaps, smaps, geo, props):
     bsdf = node("ShaderNodeBsdfPrincipled", (1400, 0))
     L.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
 
-    # Position around the wheel's own centre and axle.
-    coord = node("ShaderNodeTexCoord", (-2200, 0))
-    sub = node("ShaderNodeVectorMath", (-2000, 0), operation="SUBTRACT")
+    # Each tyre carries its own measurements (stored on the object by Make Tyre Material),
+    # so one material works on every wheel, whatever its size or where its origin is.
+    def objattr(name, loc):
+        n = node("ShaderNodeAttribute", loc, attribute_type="OBJECT", attribute_name=name)
+        return n.outputs["Vector"]
+
+    def dot(x, y, loc):
+        n = node("ShaderNodeVectorMath", loc, operation="DOT_PRODUCT")
+        L.new(x, n.inputs[0])
+        L.new(y, n.inputs[1])
+        return n.outputs["Value"]
+
+    coord = node("ShaderNodeTexCoord", (-2400, 0))
+    sub = node("ShaderNodeVectorMath", (-2200, 0), operation="SUBTRACT")
     L.new(coord.outputs["Object"], sub.inputs[0])
-    sub.inputs[1].default_value = geo["center"]
-    sep = node("ShaderNodeSeparateXYZ", (-1800, 0))
-    L.new(sub.outputs[0], sep.inputs[0])
-    axial = sep.outputs[geo["axis"]]
-    a, b = sep.outputs[geo["others"][0]], sep.outputs[geo["others"][1]]
+    L.new(objattr("pbr_tyre_center", (-2400, -200)), sub.inputs[1])
+    rel = sub.outputs[0]
+    axial = dot(rel, objattr("pbr_tyre_axis", (-2400, -350)), (-2000, 100))
+    a = dot(rel, objattr("pbr_tyre_e1", (-2400, -500)), (-2000, 0))
+    b = dot(rel, objattr("pbr_tyre_e2", (-2400, -650)), (-2000, -100))
+    dims = node("ShaderNodeSeparateXYZ", (-2200, -800))
+    L.new(objattr("pbr_tyre_size", (-2400, -800)), dims.inputs[0])
+    half_w, r_in, r_out = dims.outputs[0], dims.outputs[1], dims.outputs[2]
     # u: how far round the tyre (0..1); v: across the tread / out from the rim.
     ang = math("ARCTAN2", b, a, (-1600, 200))
     u = math("ADD", math("MULTIPLY", ang, 1 / (2 * math_pi()), (-1450, 200)), 0.5, (-1300, 200))
-    v_tread = math("ADD", math("MULTIPLY", axial, 0.5 / geo["half_w"], (-1450, 0)), 0.5, (-1300, 0))
+    v_tread = math("ADD", math("DIVIDE", axial, math("MULTIPLY", half_w, 2.0, (-1600, 0)), (-1450, 0)), 0.5, (-1300, 0))
     radius = math("SQRT", math("ADD", math("MULTIPLY", a, a, (-1600, -250)),
                                math("MULTIPLY", b, b, (-1600, -350)), (-1450, -300)), None, (-1300, -300))
-    span = max(1e-4, geo["r_out"] - geo["r_in"])
-    v_side = math("MULTIPLY", math("SUBTRACT", radius, geo["r_in"], (-1150, -300)), 1 / span, (-1000, -300))
+    span = math("MAXIMUM", math("SUBTRACT", r_out, r_in, (-1300, -420)), 1e-4, (-1150, -420))
+    v_side = math("DIVIDE", math("SUBTRACT", radius, r_in, (-1150, -300)), span, (-1000, -300))
     # The sidewall on the far side is seen from the other direction: flip it so lettering reads right.
     side_sign = math("SIGN", axial, None, (-1450, -500))
     u_side = math("ADD", math("MULTIPLY", math("SUBTRACT", u, 0.5, (-1150, -500)), side_sign, (-1000, -500)),
                   0.5, (-850, -500))
-    # Where the tyre faces sideways it's sidewall, where it faces outwards it's tread.
-    geom = node("ShaderNodeNewGeometry", (-1800, -800))
-    vt = node("ShaderNodeVectorTransform", (-1600, -800), vector_type="NORMAL",
-              convert_from="WORLD", convert_to="OBJECT")
-    # The real face direction (True Normal), not the smoothed one: with smooth shading
-    # the flat sides of a tyre get tilted normals near their edges and would pick up tread.
-    L.new(geom.outputs["True Normal"], vt.inputs[0])
-    sepn = node("ShaderNodeSeparateXYZ", (-1400, -800))
-    L.new(vt.outputs[0], sepn.inputs[0])
-    side_mask = node("ShaderNodeMapRange", (-1100, -800))
-    side_mask.inputs["From Min"].default_value = 0.45
-    side_mask.inputs["From Max"].default_value = 0.75
-    L.new(math("ABSOLUTE", sepn.outputs[geo["axis"]], None, (-1250, -800)), side_mask.inputs["Value"])
-    mask = side_mask.outputs["Result"]
+    # Which faces are sidewall (1) and which tread (0) was worked out from the mesh's real
+    # faces and stored on it: exact in Eevee and Cycles, whatever the shading.
+    side_attr = node("ShaderNodeAttribute", (-1100, -850), attribute_name=TYRE_SIDE_ATTR)
+    mask = side_attr.outputs["Fac"]
 
     # Two lookups per map with the seam in different places, keeping whichever is
     # far from its seam: no thin line where the texture wraps round (Eevee mipmaps).
@@ -5781,8 +5840,8 @@ def build_tyre_material(name, tmaps, smaps, geo, props):
     # Inside the tyre's inner edge is the rim (when it shares this material): plain metal.
     rim = node("ShaderNodeMapRange", (950, 800), label="Rim Mask")
     # (a hair outside the tyre's inner edge, so the wall of a recessed rim counts as rim)
-    rim.inputs["From Min"].default_value = geo["r_in"] * 1.02
-    rim.inputs["From Max"].default_value = geo["r_in"] * 1.005
+    L.new(math("MULTIPLY", r_in, 1.02, (800, 900)), rim.inputs["From Min"])
+    L.new(math("MULTIPLY", r_in, 1.005, (800, 800)), rim.inputs["From Max"])
     L.new(radius, rim.inputs["Value"])
     rim_mask = rim.outputs["Result"]
 
@@ -5823,8 +5882,16 @@ def tyre_repeats(props, geo):
     tread = props.tyre_tread_repeats or max(4, round(2 * math.pi * geo["r_out"] / (2 * geo["half_w"])))
     mid = (geo["r_out"] + geo["r_in"]) / 2
     span = max(1e-4, geo["r_out"] - geo["r_in"])
-    side = props.tyre_side_repeats or max(1, round(2 * math.pi * mid / (span * 3)))
+    side = props.tyre_side_repeats or max(1, round(2 * math.pi * mid / (span * 4)))
     return tread, side
+
+
+def tyre_side_aspect(props, geo):
+    """How many times wider than tall one sidewall tile is on the tyre (at mid-height).
+    The sidewall texture is made with this in mind, so nothing looks stretched."""
+    mid = (geo["r_out"] + geo["r_in"]) / 2
+    span = max(1e-4, geo["r_out"] - geo["r_in"])
+    return max(0.25, 2 * math.pi * mid / (span * tyre_repeats(props, geo)[1]))
 
 
 def math_pi():
@@ -5832,9 +5899,10 @@ def math_pi():
 
 
 class PBRGEN_OT_tyre(_ExistingChoice, bpy.types.Operator):
-    """Make a tyre material for the selected tyre: tread wrapped round it and sidewalls on \
-its sides, worked out from the tyre's shape (no UV unwrapping needed). It goes in the \
-active material slot, so pick the tyre's slot if the rim is part of the same object"""
+    """Make a tyre material for the selected tyres: tread wrapped round them and sidewalls on \
+their sides, worked out from each tyre's shape (no UV unwrapping needed). It goes in each \
+tyre's active material slot, so pick the tyre's slot if the rim is part of the same object. \
+Run it again after changing a tyre's shape"""
     bl_idname = "pbrgen.tyre"
     bl_label = "Make Tyre Material"
     bl_options = {"REGISTER", "UNDO"}
@@ -5853,14 +5921,21 @@ active material slot, so pick the tyre's slot if the rim is part of the same obj
         if geo is None:
             self.report({"ERROR"}, "Couldn't measure that object as a tyre")
             return {"CANCELLED"}
+        # Every selected tyre gets the material, each measured on its own.
+        tyres = {obj.name: geo}
+        for o in context.selected_objects:
+            if o.type == "MESH" and o.name not in tyres:
+                g = tyre_geometry(o, p.tyre_axis, p.tyre_rim_size)
+                if g is not None:
+                    tyres[o.name] = g
         replace = self.use_replace(context)
         name = self.material_name(context)
         base = name[:-4]
         settings = snapshot_settings(p)
         settings._side_repeats = tyre_repeats(p, geo)[1]
+        settings.side_aspect = tyre_side_aspect(p, geo)
         size = int(p.tex_res)
         out_dir = p.out_dir
-        obj_name = obj.name
 
         def work(stage):
             stage("making tread and sidewall")
@@ -5876,17 +5951,25 @@ active material slot, so pick the tyre's slot if the rim is part of the same obj
             mat = build_tyre_material(name, tmaps, smaps, geo, pp)
             if replace:
                 replace_datablock(old, mat, name)
-            target = bpy.data.objects.get(obj_name)
             msg = "Made '%s'" % mat.name
-            if target is not None:
+            done_on = []
+            for tname, g in tyres.items():
+                target = bpy.data.objects.get(tname)
+                if target is None:
+                    continue
+                tag_tyre_object(target, g)
                 slots = target.data.materials
                 if slots and target.active_material_index < len(slots):
                     slots[target.active_material_index] = mat
                 else:
                     slots.append(mat)
-                msg += " on '%s' (axle along %s, radius %s)" % (target.name, "XYZ"[geo["axis"]], _metres(geo["r_out"]))
                 if pp.use_displacement and pp.displacement_subdivide:
                     add_displacement_subdivision(target, pp.displacement_levels)
+                done_on.append(tname)
+            if len(done_on) == 1:
+                msg += " on '%s' (axle along %s, radius %s)" % (done_on[0], "XYZ"[geo["axis"]], _metres(geo["r_out"]))
+            elif done_on:
+                msg += " on %d tyres" % len(done_on)
             if pp.mark_as_asset:
                 mark_asset(mat, "Tyre")
             self.report({"INFO"}, msg)
@@ -6452,7 +6535,7 @@ class PBRGEN_PT_tyre(PBRGEN_PT_base, bpy.types.Panel):
         row.prop(p, "tyre_rim_color", text="")
         layout.row().prop(p, "tyre_axis", expand=True)
         layout.operator("pbrgen.tyre", icon="MESH_TORUS")
-        layout.label(text="Uses the active material slot", icon="INFO")
+        layout.label(text="Select all tyres: each gets it", icon="INFO")
 
 
 class PBRGEN_PT_bake(PBRGEN_PT_base, bpy.types.Panel):
