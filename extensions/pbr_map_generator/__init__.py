@@ -20,7 +20,7 @@ Find it in the 3D Viewport sidebar (N key) under the "PBR Maps" tab.
 bl_info = {  # only used by the old add-on system; blender_manifest.toml is what counts
     "name": "PBR Map Generator",
     "author": "PBR Map Generator",
-    "version": (1, 13, 2),
+    "version": (1, 14, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > PBR Maps",
     "description": "Generate normal, bump, roughness and AO maps from images, plus procedural textures",
@@ -1432,22 +1432,35 @@ def _glyph_bits(seed, n=64):
 def pat_sidewall(p, size, rng):
     """Tyre sidewall. Left-right goes around the tyre; bottom is the rim, top is the
     tread shoulder. Rubber grain, ridges, raised lettering and shoulder blocks."""
-    yy, xx = pixel_grid(size)
-    u, v = xx / size, yy / size
-    asp = getattr(p, "side_aspect", 1.0)  # how much wider than tall this tile is on the tyre
-    grain = fbm_wide(size, size, max(16, size // 32), 3, rng, asp)
+    H = size
+    W = int(getattr(p, "side_width", size))  # the tyre tool makes one long strip for the whole turn
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    yy += 0.5
+    xx += 0.5
+    u, v = xx / W, yy / H
+    # how much wider than tall one pixel ends up on the tyre (1 = not stretched)
+    asp = getattr(p, "side_aspect", 1.0) * H / W
+    grain = fbm_wide(H, W, max(16, H // 32), 3, rng, asp)
     height = 0.4 + (grain - 0.5) * 0.04 * p.tex_bump
+    letters = getattr(p, "side_letters", None)
     # A soft bulge across the wall, and thin rings near the rim and below the shoulder.
     height = height + 0.06 * np.sin(np.clip(v, 0, 1) * np.pi)
-    for c, w in ((0.1, 0.006), (0.68, 0.005)):
+    for c, w in (((0.08, 0.004), (0.8, 0.004)) if letters is not None else ((0.1, 0.006), (0.68, 0.005))):
         height = height + 0.08 * np.exp(-((v - c) / w) ** 2)
-    letters_on = np.zeros((size, size), np.float32)
+    letters_on = np.zeros((H, W), np.float32)
+    white_on = None
+    if letters is not None:
+        # Real text laid out by the tyre tool (brand, size marking, small print).
+        letters_on = letters.astype(np.float32)
+        white_on = getattr(p, "side_white", None)
+        height = height + letters_on * 0.07
     # Raised lettering band: words of blocky letters going round the tyre.
-    if p.tex_detail > 0:
+    elif p.tex_detail > 0:
+        size = H
         v0, v1 = 0.36, 0.52
         band_h = (v1 - v0) * size
         char_w = band_h * 0.62 / asp
-        n_chars = max(8, int(size / char_w))
+        n_chars = max(8, int(W / char_w))
         cu = u * n_chars
         ci = np.floor(cu).astype(np.int64) % n_chars
         fx = cu - np.floor(cu)
@@ -1468,13 +1481,14 @@ def pat_sidewall(p, size, rng):
     c = np.floor(uu).astype(np.int64)
     fu = uu - c
     start = np.where(c % 2 == 0, 0.8, 0.86)
-    unit = size / n
-    d = np.minimum(np.minimum(fu, 1 - fu) * unit - p.tex_gap * unit * 0.5, (v - start) * size)
-    block = smoothstep(0.0, max(1.0, p.tex_bevel * unit * 0.3), d)
+    unit = W / n
+    d = np.minimum(np.minimum(fu, 1 - fu) * unit - p.tex_gap * unit * 0.5, (v - start) * H)
+    block = smoothstep(0.0, max(1.0, p.tex_bevel * min(unit, H) * 0.3), d)
     height = np.maximum(height, block * (0.62 + (grain - 0.5) * 0.04))
     rubber = _color(p.tex_color1) * (0.9 + 0.2 * grain[..., None])
     rubber = _mix(rubber, _color(p.tex_color2), block[..., None] * 0.5)
-    albedo = _mix(rubber, _color(p.tex_gap_color), letters_on[..., None])
+    tint = letters_on if white_on is None else white_on
+    albedo = _mix(rubber, _color(p.tex_gap_color), tint[..., None])
     rough = np.clip(p.tex_rough + (grain - 0.5) * 0.06 - letters_on * 0.1, 0, 1)
     return {"height": np.clip(height, 0, 1), "albedo": albedo, "rough": rough}
 
@@ -3015,6 +3029,16 @@ class PBRGEN_Props(bpy.types.PropertyGroup):
                ("RAISED", "Raised", "Raised black rubber lettering"),
                ("WHITE", "White", "Raised white lettering, like classic off-road tyres")],
         default="RAISED")
+    tyre_brand: StringProperty(
+        name="Brand", default="MARSHALL",
+        description="Brand name in big outline letters on the sidewall")
+    tyre_model: StringProperty(
+        name="Model", default="",
+        description="Tyre model name on the sidewall. Empty = a name that suits the tread style")
+    tyre_marking: StringProperty(
+        name="Size", default="",
+        description="The size marking, like 'LT285/75 R16'. Empty = worked out from your tyre's real "
+                    "size (width, sidewall height and rim), with a matching load index and speed rating")
     tyre_tread_repeats: IntProperty(
         name="Tread Repeats", default=0, min=0, max=200,
         description="How many times the tread pattern goes round the tyre. 0 = Auto (lugs keep their shape)")
@@ -5577,10 +5601,11 @@ def pack_grooves(data, size, amount, color, rough, seed, asp=1.0):
         return data
     rng = np.random.default_rng(seed)
     h = np.clip(data["height"], 0, 1)
-    around = gauss_blur(h, max(2, size // 48))
+    H, W = h.shape
+    around = gauss_blur(h, max(2, H // 48))
     groove = smoothstep(0.03, 0.1, around - h)          # only real grooves and gaps
-    clumps = normalize01(fbm_wide(size, size, 5, 4, rng, asp))
-    noise = fbm_wide(size, size, 24, 3, rng, asp)
+    clumps = normalize01(fbm_wide(H, W, 5, 4, rng, asp))
+    noise = fbm_wide(H, W, 24, 3, rng, asp)
     # Patchy: packed full in some places, clean rubber in others; more amount = more patches.
     t = 0.85 - amount * 0.6
     patch = smoothstep(t, t + 0.12, clumps + (noise - 0.5) * 0.25)
@@ -5608,13 +5633,17 @@ def tyre_arrays(settings, size):
     w.tex_gap, w.tex_bevel, w.tex_bump, w.tex_rough = 0.35, 0.3, 0.4, 0.75
     w.tex_detail = 0.0 if settings.tyre_letters == "NONE" else 1.0
     w.tex_gap_color = (0.8, 0.8, 0.78) if settings.tyre_letters == "WHITE" else (0.045, 0.045, 0.047)
-    side = pat_sidewall(w, size, np.random.default_rng(s.tex_seed + 1))
+    side_h = getattr(settings, "side_height_px", size)
+    w.side_width = getattr(settings, "side_width", side_h)
+    w.side_letters = getattr(settings, "side_letters", None)
+    w.side_white = getattr(settings, "side_white", None)
+    side = pat_sidewall(w, side_h, np.random.default_rng(s.tex_seed + 1))
+    pix_asp = getattr(settings, "side_aspect", 1.0) * side_h / w.side_width
     for amount, color, rough, salt in ((settings.tyre_mud, (0.16, 0.11, 0.07), 0.9, 11),
                                        (settings.tyre_snow, (0.78, 0.81, 0.86), 0.55, 12)):
         tread = pack_grooves(tread, size, amount, color, rough, s.tex_seed + salt)
-        side = pack_grooves(side, size, amount * 0.25, color, rough, s.tex_seed + salt + 1,
-                            getattr(settings, "side_aspect", 1.0))
-    return _finish_arrays(tread, s, size), _finish_arrays(side, s, size)
+        side = pack_grooves(side, side_h, amount * 0.25, color, rough, s.tex_seed + salt + 1, pix_asp)
+    return _finish_arrays(tread, s, size), _finish_arrays(side, s, side_h)
 
 
 def tyre_geometry(obj, axis_pref="AUTO", rim_size=0.0):
@@ -5777,8 +5806,9 @@ def build_tyre_material(name, tmaps, smaps, geo, props):
                                math("MULTIPLY", b, b, (-1600, -350)), (-1450, -300)), None, (-1300, -300))
     span = math("MAXIMUM", math("SUBTRACT", r_out, r_in, (-1300, -420)), 1e-4, (-1150, -420))
     v_side = math("DIVIDE", math("SUBTRACT", radius, r_in, (-1150, -300)), span, (-1000, -300))
-    # The sidewall on the far side is seen from the other direction: flip it so lettering reads right.
-    side_sign = math("SIGN", axial, None, (-1450, -500))
+    # Each sidewall is seen from its own side: run the texture clockwise as seen from
+    # outside on both, so the lettering reads left to right (tops towards the tread).
+    side_sign = math("MULTIPLY", math("SIGN", axial, None, (-1600, -500)), -1.0, (-1450, -500))
     u_side = math("ADD", math("MULTIPLY", math("SUBTRACT", u, 0.5, (-1150, -500)), side_sign, (-1000, -500)),
                   0.5, (-850, -500))
     # Which faces are sidewall (1) and which tread (0) was worked out from the mesh's real
@@ -5882,7 +5912,10 @@ def tyre_repeats(props, geo):
     tread = props.tyre_tread_repeats or max(4, round(2 * math.pi * geo["r_out"] / (2 * geo["half_w"])))
     mid = (geo["r_out"] + geo["r_in"]) / 2
     span = max(1e-4, geo["r_out"] - geo["r_in"])
-    side = props.tyre_side_repeats or max(1, round(2 * math.pi * mid / (span * 4)))
+    if props.tyre_letters != "NONE":
+        side = 1  # the text is laid out once round the whole tyre, like a real one
+    else:
+        side = props.tyre_side_repeats or max(1, round(2 * math.pi * mid / (span * 4)))
     return tread, side
 
 
@@ -5896,6 +5929,170 @@ def tyre_side_aspect(props, geo):
 
 def math_pi():
     return math.pi
+
+
+# ---------------------------------------------------------------------------
+# Tyre sidewall text: brand, size marking and small print, laid out like a real tyre
+# ---------------------------------------------------------------------------
+
+TYRE_SPEED = {"OFFROAD": "S", "ALLTERRAIN": "T", "MUD": "Q", "SNOW": "T"}
+TYRE_MODEL = {"OFFROAD": "TRAIL MASTER", "ALLTERRAIN": "ALL TERRAIN", "MUD": "MUD TERRAIN", "SNOW": "WINTER GRIP"}
+
+
+def render_text_mask(text, px):
+    """Draw text with Blender's own font into a float mask (row 0 = bottom), cropped to the ink.
+    Main thread only."""
+    import blf
+    import imbuf
+    fid = 0
+    blf.size(fid, px)
+    w, _h = blf.dimensions(fid, text)
+    W, H = int(w) + 8, int(px * 1.6) + 8
+    ib = imbuf.new((W, H))
+    with blf.bind_imbuf(fid, ib):
+        blf.color(fid, 1.0, 1.0, 1.0, 1.0)
+        blf.position(fid, 4, int(px * 0.4) + 4, 0)
+        blf.draw_buffer(fid, text)
+    os.makedirs(PREVIEW_DIR, exist_ok=True)
+    path = os.path.join(PREVIEW_DIR, "text_%d.png" % os.getpid())
+    imbuf.write(ib, filepath=path)
+    img = bpy.data.images.load(path, check_existing=False)
+    try:
+        a = image_to_array(img)
+    finally:
+        bpy.data.images.remove(img)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    m = np.clip(np.maximum(a[..., :3].max(-1), a[..., 3]), 0, 1).astype(np.float32)
+    rows = np.nonzero(m.max(1) > 0.2)[0]
+    cols = np.nonzero(m.max(0) > 0.2)[0]
+    if len(rows) == 0:
+        return np.zeros((1, 1), np.float32)
+    return m[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+
+
+def _dilate(m, r):
+    """Thicken a mask by r pixels (square brush), staying the same size."""
+    r = int(r)
+    if r < 1:
+        return m
+    p = np.pad(m, r)
+    out = m.copy()
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            out = np.maximum(out, p[r + dy:r + dy + m.shape[0], r + dx:r + dx + m.shape[1]])
+    return out
+
+
+def _triangle(px):
+    """A small solid triangle pointing up (the tread-wear indicator mark)."""
+    h = max(3, int(px))
+    yy, xx = np.mgrid[0:h, 0:h].astype(np.float32)
+    half = (h - yy) / 2.0  # wide at the bottom, a point at the top (row 0 = bottom)
+    return (np.abs(xx - h / 2) <= half).astype(np.float32)
+
+
+def tyre_marking(obj, geo, style, brand="", model="", custom=""):
+    """Size marking worked out from the tyre's real size (object scale included), in the
+    standard format: [LT]width/aspect R rim  load-index speed-rating."""
+    sc = obj.matrix_world.to_scale()
+    ax, o1, o2 = geo["axis"], geo["others"][0], geo["others"][1]
+    rad_s = (abs(sc[o1]) + abs(sc[o2])) / 2
+    width_mm = 2 * geo["half_w"] * abs(sc[ax]) * 1000
+    side_mm = (geo["r_out"] - geo["r_in"]) * rad_s * 1000
+    rim_in = 2 * geo["r_in"] * rad_s / 0.0254
+    w = max(105, int(round((width_mm - 5) / 10)) * 10 + 5)
+    a = int(min(95, max(25, round(side_mm / max(width_mm, 1e-6) * 100 / 5) * 5)))
+    rim = max(8, int(round(rim_in)))
+    lt = style != "SNOW"
+    li = int(min(150, max(60, round(13 + 0.32 * w + rim + 0.25 * (a - 65)))))
+    speed = TYRE_SPEED.get(style, "T")
+    prefix = "LT" if lt else ""
+    size = "%s%d/%d R%d" % (prefix, w, a, rim)
+    if custom.strip():
+        size = custom.strip().upper()
+    big = ("M+S " if style == "SNOW" else "") + size.replace(" R", " R ")
+    full = "%s %d%s" % (size, li, speed) if not custom.strip() else size
+    kg = 615 * math.exp((li - 91) * math.log(1450 / 615) / 30)
+    kpa, psi = (550, 80) if lt else (350, 51)
+    week, year = int(time.strftime("%W")) or 1, int(time.strftime("%y"))
+    realistic = 100 <= width_mm <= 450 and 10 <= rim_in <= 26 and 20 <= side_mm / max(width_mm, 1e-6) * 100 <= 100
+    return {
+        "brand": (brand or "MARSHALL").upper(),
+        "model": (model or TYRE_MODEL.get(style, "")).upper(),
+        "big": big, "full": full,
+        "small": [
+            "%s  RADIAL TUBELESS" % full,
+            "MAX LOAD %d kg (%d LBS) AT %d kPa (%d PSI) MAX PRESS" % (round(kg / 5) * 5, round(kg * 2.2046 / 5) * 5, kpa, psi),
+            "SAFETY WARNING: SERIOUS INJURY MAY RESULT FROM TYRE FAILURE DUE TO UNDERINFLATION OR OVERLOADING",
+            "DOT X3XX 4E2K %02d%02d   MADE IN UK" % (week, year),
+        ],
+        "realistic": realistic,
+        "measured": "%.0f mm wide, %.0f mm sidewall, %.1f in rim" % (width_mm, side_mm, rim_in),
+    }
+
+
+def sidewall_lettering(H, W, mark, white_style):
+    """Lay out one full turn of sidewall text, like a real tyre: the brand in big outline
+    letters, the big size marking twice, the model name, small print and tread-wear
+    triangles. Returns (raised mask, white mask), both H x W, row 0 = the rim side."""
+    canvas = np.zeros((H, W), np.float32)
+    white = np.zeros((H, W), np.float32)
+
+    def place(m, u, v, is_white):
+        h, w = m.shape
+        if w > W * 0.45:  # never let one item take more than ~half the way round
+            k = W * 0.45 / w
+            ys = np.linspace(0, h - 1, max(2, int(h * k))).astype(int)
+            xs = np.linspace(0, w - 1, max(2, int(w * k))).astype(int)
+            m = m[ys][:, xs]
+            h, w = m.shape
+        x0 = int(u * W - w / 2)
+        y0 = int(v * H - h / 2)
+        rows = np.arange(y0, y0 + h)
+        keep = (rows >= 0) & (rows < H)
+        cols = (x0 + np.arange(w)) % W
+        sub = m[keep]
+        region = canvas[np.ix_(rows[keep], cols)]
+        canvas[np.ix_(rows[keep], cols)] = np.maximum(region, sub)
+        if is_white:
+            wr = white[np.ix_(rows[keep], cols)]
+            white[np.ix_(rows[keep], cols)] = np.maximum(wr, sub)
+
+    def text(t, hfrac, bold=0.0, outline=False):
+        px = max(8, int(hfrac * H * 1.35))  # font size -> cap height about hfrac of the wall
+        m = render_text_mask(t, px)
+        if bold:
+            m = _dilate(m, max(1, int(px * bold)))
+        if outline:
+            # bold letters with a thin outline ring a little way outside them
+            r = max(1, int(px / 30))
+            m = np.pad(m, r * 4)
+            ring = np.clip(_dilate(m, r * 3) - _dilate(m, r * 2), 0, 1)
+            m = np.maximum(m, ring)
+        return m
+
+    brand = text(mark["brand"], 0.30, bold=0.03, outline=True)
+    model = text(mark["model"], 0.18, bold=0.04)
+    big = text(mark["big"], 0.17, bold=0.045)
+    place(brand, 0.0, 0.52, white_style)
+    place(model, 0.5, 0.52, white_style)
+    for u in (0.25, 0.75):
+        place(big, u, 0.52, white_style)
+    small = [text(s, 0.045, bold=0.02) for s in mark["small"]]
+    for (m, u, v) in ((small[0], 0.5, 0.27), (small[1], 0.25, 0.27), (small[2], 0.0, 0.27),
+                      (small[3], 0.75, 0.27)):
+        place(m, u, v, False)
+    tri = _triangle(0.06 * H)
+    for k in range(6):
+        place(tri, (k + 0.5) / 6, 0.74, False)
+    canvas = gauss_blur(canvas, max(1, H // 700))
+    return canvas, white
+
+
+_tyre_state = {"mark": None}
 
 
 class PBRGEN_OT_tyre(_ExistingChoice, bpy.types.Operator):
@@ -5935,6 +6132,26 @@ Run it again after changing a tyre's shape"""
         settings._side_repeats = tyre_repeats(p, geo)[1]
         settings.side_aspect = tyre_side_aspect(p, geo)
         size = int(p.tex_res)
+        if p.tyre_letters != "NONE":
+            # One long sidewall strip for the whole turn, with the real text drawn in
+            # (text drawing has to happen here, on Blender's main thread).
+            mark = tyre_marking(obj, geo, p.tyre_style, p.tyre_brand, p.tyre_model, p.tyre_marking)
+            _tyre_state["mark"] = mark
+            h = max(256, size // 2)
+            wpx = int(h * settings.side_aspect)
+            if wpx > 8192:
+                h = max(128, int(h * 8192 / wpx))
+                wpx = int(h * settings.side_aspect)
+            settings.side_height_px, settings.side_width = h, max(h, wpx)
+            try:
+                settings.side_letters, settings.side_white = sidewall_lettering(
+                    h, settings.side_width, mark, p.tyre_letters == "WHITE")
+            except Exception as e:  # noqa: BLE001 - fall back to the simple lettering
+                print("PBR Map Generator: couldn't draw tyre text:", e)
+                settings.side_letters = settings.side_white = None
+            if not mark["realistic"]:
+                self.report({"WARNING"}, "Your tyre measures %s: check the model's scale, or type the "
+                                         "marking yourself in the Tyre panel" % mark["measured"])
         out_dir = p.out_dir
 
         def work(stage):
@@ -6523,6 +6740,14 @@ class PBRGEN_PT_tyre(PBRGEN_PT_base, bpy.types.Panel):
             layout.label(text="%s, slot: %s" % (obj.name, slot), icon="OBJECT_DATA")
         layout.prop(p, "tyre_style")
         layout.row().prop(p, "tyre_letters", expand=True)
+        if p.tyre_letters != "NONE":
+            col = layout.column(align=True)
+            col.prop(p, "tyre_brand")
+            col.prop(p, "tyre_model", placeholder=TYRE_MODEL.get(p.tyre_style, ""))
+            col.prop(p, "tyre_marking", placeholder="Auto (from your tyre)")
+            mark = _tyre_state.get("mark")
+            if mark:
+                layout.label(text="Last: " + mark["full"], icon="INFO")
         col = layout.column(align=True)
         col.prop(p, "tyre_snow", slider=True)
         col.prop(p, "tyre_mud", slider=True)
